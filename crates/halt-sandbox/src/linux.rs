@@ -232,8 +232,6 @@ pub fn apply_landlock(_ruleset: ()) -> Result<(), SandboxError> {
 #[cfg(target_os = "linux")]
 unsafe fn bring_up_loopback() {
     const IFNAMSIZ: usize = 16;
-    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
     const IFF_UP: i16 = 0x1;
 
     /// Mirrors the C `struct ifreq` layout for SIOCGIFFLAGS / SIOCSIFFLAGS.
@@ -258,9 +256,9 @@ unsafe fn bring_up_loopback() {
     if sock < 0 {
         return;
     }
-    libc::ioctl(sock, SIOCGIFFLAGS, &mut req as *mut IfReq as *mut libc::c_void);
+    libc::ioctl(sock, libc::SIOCGIFFLAGS as _, &mut req as *mut IfReq as *mut libc::c_void);
     req.ifr_flags |= IFF_UP;
-    libc::ioctl(sock, SIOCSIFFLAGS, &mut req as *mut IfReq as *mut libc::c_void);
+    libc::ioctl(sock, libc::SIOCSIFFLAGS as _, &mut req as *mut IfReq as *mut libc::c_void);
     libc::close(sock);
 }
 
