@@ -78,3 +78,94 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all -- --check
+
+  # ── Agent config tests (Linux sandbox via Docker) ─────────────────────────
+  # Builds halt inside Ubuntu 24.04 (Landlock ABI v4, kernel 6.8) and runs
+  # smoke tests for every Linux agent config (claude / codex / gemini):
+  #   - Filesystem: Landlock blocks writes outside workspace
+  #   - Network:    proxy resolves allowed domains, blocks everything else
+  #   - Strict:     exit 2 on violation
+  #
+  # --cap-add NET_ADMIN is required for halt's ProxyOnly network namespace
+  # (unshare CLONE_NEWNET + ip-link for veth pair).
+  test-linux-agents:
+    name: Agent configs (Linux / Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build halt-test Docker image
+        run: |
+          docker build \
+            --file docker/Dockerfile \
+            --tag halt-test \
+            .
+
+      - name: Run agent-config smoke tests
+        run: |
+          docker run --rm \
+            --cap-add NET_ADMIN \
+            halt-test \
+            /halt/docker/test-agent-configs.sh
+
+  # ── macOS agent config smoke tests ───────────────────────────────────────
+  # Builds halt natively on macOS and runs a lightweight check that each
+  # agent config parses and that halt starts a sandboxed process with it.
+  # Full Keychain / SBPL tests are handled by the main test matrix above.
+  test-macos-agents:
+    name: Agent configs (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-agents-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build halt
+        run: cargo build --workspace --release
+
+      - name: Smoke-test each macOS agent config
+        run: |
+          HALT=./target/release/halt
+          PASS=0; FAIL=0
+
+          for AGENT in claude codex gemini; do
+            CONFIG="configs/${AGENT}.toml"
+
+            # 1. Config parses and halt starts a trivial sandboxed command.
+            if "$HALT" run --no-config --config "$CONFIG" -- /bin/echo "ok-${AGENT}" \
+                2>/tmp/halt_stderr_${AGENT}; then
+              echo "✓ $AGENT: sandbox starts"
+              ((PASS++))
+            else
+              echo "✗ $AGENT: sandbox failed (exit $?)" >&2
+              cat /tmp/halt_stderr_${AGENT} >&2
+              ((FAIL++))
+            fi
+
+            # 2. Blocked domain gets NXDOMAIN through the proxy (curl exit 6).
+            CURL_EXIT=0
+            "$HALT" run --no-config --config "$CONFIG" \
+              -- curl -sS --max-time 5 https://blocked-domain.invalid \
+                 -o /dev/null 2>/dev/null || CURL_EXIT=$?
+            if [ "$CURL_EXIT" -eq 6 ]; then
+              echo "✓ $AGENT: blocked domain returns NXDOMAIN"
+              ((PASS++))
+            else
+              echo "✗ $AGENT: blocked domain not filtered (curl exit $CURL_EXIT)" >&2
+              ((FAIL++))
+            fi
+          done
+
+          echo ""
+          echo "Results: ${PASS} passed, ${FAIL} failed"
+          [ "$FAIL" -eq 0 ]
