@@ -6,7 +6,6 @@
 //! # Protocol Support
 //!
 //! - UDP DNS (standard port 53 or custom)
-//! - TCP DNS (for large responses)
 //! - IPv4 and IPv6 resolution
 //!
 //! # Resolution Flow
@@ -49,10 +48,10 @@ pub struct DnsServerConfig {
     /// Set explicitly to override system resolvers.
     pub upstream: Option<Vec<SocketAddr>>,
 
-    /// DNS response TTL in seconds.
+    /// DNS response TTL.
     /// Used for caching and client-side caching hints.
-    /// Default: 300 (5 minutes)
-    pub ttl_seconds: u32,
+    /// Default: 5 minutes
+    pub ttl: std::time::Duration,
 }
 
 impl Default for DnsServerConfig {
@@ -60,7 +59,7 @@ impl Default for DnsServerConfig {
         Self {
             bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
             upstream: None, // Use system resolvers
-            ttl_seconds: 300,
+            ttl: std::time::Duration::from_secs(300),
         }
     }
 }
@@ -138,9 +137,9 @@ impl DnsServer {
     /// * `config` - Server configuration
     /// * `state` - Shared state containing domain filter and cache
     ///
-    /// # Returns
-    /// * `Ok(DnsServer)` - The configured server (not yet running)
-    /// * `Err(ProxyError)` - If configuration is invalid
+    /// # Errors
+    /// Currently infallible; always returns `Ok`. The `Result` return type
+    /// is present for forward compatibility.
     pub fn new(config: DnsServerConfig, state: Arc<SharedState>) -> Result<Self> {
         Ok(Self { config, state })
     }
@@ -150,10 +149,9 @@ impl DnsServer {
     /// Binds to the configured address and starts handling DNS queries.
     /// This method runs until the server is shut down.
     ///
-    /// # Returns
-    /// * `Ok(())` - Server shut down gracefully
-    /// * `Err(ProxyError::Bind)` - Failed to bind to address
-    /// * `Err(ProxyError::Internal)` - Server error
+    /// # Errors
+    /// * `ProxyError::Bind` - If binding to `config.bind_addr` fails.
+    /// * `ProxyError::Internal` - Fatal server error during operation.
     pub async fn run(&self) -> Result<()> {
         use tokio::net::UdpSocket;
 
@@ -165,6 +163,17 @@ impl DnsServer {
                     source: e,
                 })?;
 
+        self.run_on(socket).await
+    }
+
+    /// Run the DNS server on a pre-bound socket.
+    ///
+    /// Used by [`crate::ProxyServer::start`] which pre-binds the socket to
+    /// obtain the actual OS-assigned port before spawning the server task.
+    ///
+    /// # Errors
+    /// * `Err(ProxyError::Internal)` - Server error
+    pub async fn run_on(&self, socket: tokio::net::UdpSocket) -> Result<()> {
         let mut buf = [0u8; 512]; // Standard DNS UDP packet size
 
         loop {
@@ -262,12 +271,12 @@ impl DnsServer {
             domain: domain_lower.clone(),
             addresses: addresses.clone(),
             expires_at: std::time::Instant::now()
-                + std::time::Duration::from_secs(self.config.ttl_seconds as u64),
+                + self.config.ttl,
         };
-        self.state.cache.insert(resolved);
+        self.state.insert_resolved(resolved);
 
         // Build response with resolved addresses
-        Ok(self.build_response(query, &addresses, self.config.ttl_seconds))
+        Ok(self.build_response(query, &addresses, self.config.ttl.as_secs() as u32))
     }
 
     /// Parse the domain name from a DNS query packet.
@@ -747,7 +756,7 @@ mod tests {
     #[test]
     fn test_dns_server_config_default_ttl() {
         let config = DnsServerConfig::default();
-        assert_eq!(config.ttl_seconds, 300);
+        assert_eq!(config.ttl, std::time::Duration::from_secs(300));
     }
 
     #[test]
@@ -785,12 +794,12 @@ mod tests {
     fn test_dns_server_new_with_custom_ttl() {
         use crate::SharedState;
         let config = DnsServerConfig {
-            ttl_seconds: 600,
+            ttl: std::time::Duration::from_secs(600),
             ..Default::default()
         };
         let state = Arc::new(SharedState::new(vec![]));
         let server = DnsServer::new(config, state).unwrap();
-        assert_eq!(server.config.ttl_seconds, 600);
+        assert_eq!(server.config.ttl, std::time::Duration::from_secs(600));
     }
 
     // ========================================================================
@@ -1056,7 +1065,7 @@ mod tests {
         use crate::SharedState;
         let state = Arc::new(SharedState::new(vec!["example.com".to_string()]));
         let config = DnsServerConfig {
-            ttl_seconds: 1, // 1 second TTL
+            ttl: std::time::Duration::from_secs(1), // 1 second TTL
             ..Default::default()
         };
         let server = DnsServer::new(config, state.clone()).unwrap();

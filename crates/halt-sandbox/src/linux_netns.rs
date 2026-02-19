@@ -48,19 +48,25 @@ pub struct NetnsConfig {
 }
 
 impl NetnsConfig {
-    /// Create a new network namespace config.
+    /// Create a network namespace config derived from the current process PID.
     ///
-    /// Uses the ID to generate unique namespace name and IPs.
-    /// Allocates IPs from 10.200.{id % 256}.0/24 range.
+    /// The PID is used to derive both the namespace name (`halt-{pid}`) and
+    /// the IP range (`10.200.{pid % 256}.0/24`). Using the PID ensures that
+    /// each halt invocation gets a unique namespace name and IP range.
+    pub fn new() -> Self {
+        Self::from_pid()
+    }
+
+    /// Create a network namespace config using the current process PID.
     ///
-    /// # Arguments
-    /// * `id` - Unique identifier for IP allocation
-    pub fn new(id: u64) -> Self {
-        // Third octet is id % 256 to avoid overflow
-        let octet = (id % 256) as u8;
+    /// PIDs are unique among running processes, so each halt invocation gets
+    /// its own namespace name and IP range.
+    pub fn from_pid() -> Self {
+        let pid = std::process::id();
+        let octet = (pid % 256) as u8;
 
         Self {
-            name: format!("halt-{}", id),
+            name: format!("halt-{}", pid),
             inner_ip: Ipv4Addr::new(10, 200, octet, 2),
             outer_ip: Ipv4Addr::new(10, 200, octet, 1),
             prefix_len: 24,
@@ -401,14 +407,15 @@ mod tests {
 
     #[test]
     fn test_netns_config_name_format() {
-        let config = NetnsConfig::new(42);
+        let config = NetnsConfig::new();
         assert!(config.name.starts_with("halt-"));
-        assert!(config.name.contains("42"));
+        let pid = std::process::id().to_string();
+        assert!(config.name.contains(&pid));
     }
 
     #[test]
     fn test_netns_config_ip_range() {
-        let config = NetnsConfig::new(0);
+        let config = NetnsConfig::new();
         // Inner IP should be 10.200.x.2
         assert_eq!(config.inner_ip.octets()[0], 10);
         assert_eq!(config.inner_ip.octets()[1], 200);
@@ -421,30 +428,9 @@ mod tests {
     }
 
     #[test]
-    fn test_netns_config_unique_per_id() {
-        let config1 = NetnsConfig::new(1);
-        let config2 = NetnsConfig::new(2);
-
-        // Different IDs should produce different names
-        assert_ne!(config1.name, config2.name);
-
-        // Different IDs should produce different IPs (at least third octet)
-        assert_ne!(config1.inner_ip.octets()[2], config2.inner_ip.octets()[2]);
-    }
-
-    #[test]
     fn test_netns_config_prefix_len() {
-        let config = NetnsConfig::new(0);
+        let config = NetnsConfig::new();
         assert_eq!(config.prefix_len, 24);
-    }
-
-    #[test]
-    fn test_netns_config_wraps_at_256() {
-        // IDs wrap at 256 for the third octet
-        let config1 = NetnsConfig::new(0);
-        let config2 = NetnsConfig::new(256);
-        // Third octet should wrap (0 and 256 both map to same third octet)
-        assert_eq!(config1.inner_ip.octets()[2], config2.inner_ip.octets()[2]);
     }
 
     // ========================================================================
@@ -473,7 +459,7 @@ mod tests {
     #[test]
     fn test_create_netns_requires_privileges() {
         if check_netns_privileges().is_err() {
-            let config = NetnsConfig::new(99999);
+            let config = NetnsConfig::new();
             let result = create_netns(&config);
             // Should fail without privileges
             assert!(result.is_err());

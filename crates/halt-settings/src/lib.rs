@@ -12,8 +12,8 @@
 //! ```no_run
 //! use halt_settings::ConfigLoader;
 //!
-//! let config = ConfigLoader::load(std::path::Path::new("."));
-//! println!("{:?}", config.sandbox.mode);
+//! let config = ConfigLoader::load(std::path::Path::new(".")).unwrap();
+//! println!("{:?}", config.sandbox.network);
 //! ```
 
 mod loader;
@@ -38,17 +38,6 @@ pub enum SettingsError {
     /// I/O error reading or writing a config file.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-}
-
-/// Sandbox execution mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxMode {
-    /// No sandboxing — execute the process directly.
-    #[default]
-    None,
-    /// Native OS sandboxing (macOS Seatbelt / Linux Landlock).
-    Native,
 }
 
 /// Network isolation mode for sandboxed processes.
@@ -125,10 +114,6 @@ pub struct Mount {
 /// TOML `[sandbox]` section.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxSettings {
-    /// Sandbox execution mode.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<SandboxMode>,
-
     /// Network isolation mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkMode>,
@@ -149,14 +134,6 @@ pub struct ProxySettings {
     /// Supports exact matches (`example.com`) and wildcards (`*.github.com`).
     #[serde(default)]
     pub domain_allowlist: Vec<String>,
-
-    /// DNS server bind address (e.g. `"127.0.0.1:5353"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dns_bind_addr: Option<String>,
-
-    /// TCP proxy bind address (e.g. `"127.0.0.1:9300"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_bind_addr: Option<String>,
 
     /// Upstream DNS servers (e.g. `["8.8.8.8:53"]`).
     /// If absent, system resolvers from `/etc/resolv.conf` are used.
@@ -238,27 +215,22 @@ impl HaltConfig {
     #[must_use]
     pub fn merge(mut self, other: HaltConfig) -> HaltConfig {
         // sandbox scalars: project wins if set
-        if other.sandbox.mode.is_some() {
-            self.sandbox.mode = other.sandbox.mode;
-        }
         if other.sandbox.network.is_some() {
             self.sandbox.network = other.sandbox.network;
         }
-        // sandbox lists: global + project
+        // sandbox lists: global + project (deduplicated)
         self.sandbox.paths.traversal.extend(other.sandbox.paths.traversal);
+        dedup_preserve_order(&mut self.sandbox.paths.traversal);
         self.sandbox.paths.read.extend(other.sandbox.paths.read);
+        dedup_preserve_order(&mut self.sandbox.paths.read);
         self.sandbox.paths.read_write.extend(other.sandbox.paths.read_write);
+        dedup_preserve_order(&mut self.sandbox.paths.read_write);
         self.sandbox.mounts.extend(other.sandbox.mounts);
 
-        // proxy lists: global + project
+        // proxy lists: global + project (deduplicated)
         self.proxy.domain_allowlist.extend(other.proxy.domain_allowlist);
+        dedup_preserve_order(&mut self.proxy.domain_allowlist);
         // proxy scalars: project wins if set
-        if other.proxy.dns_bind_addr.is_some() {
-            self.proxy.dns_bind_addr = other.proxy.dns_bind_addr;
-        }
-        if other.proxy.proxy_bind_addr.is_some() {
-            self.proxy.proxy_bind_addr = other.proxy.proxy_bind_addr;
-        }
         if other.proxy.upstream_dns.is_some() {
             self.proxy.upstream_dns = other.proxy.upstream_dns;
         }
@@ -275,6 +247,12 @@ impl HaltConfig {
     }
 }
 
+/// Remove duplicates from a `Vec<String>` while preserving insertion order.
+fn dedup_preserve_order(v: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    v.retain(|x| seen.insert(x.clone()));
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -283,20 +261,8 @@ mod tests {
     #[test]
     fn test_parse_empty_config() {
         let config = HaltConfig::parse("").unwrap();
-        assert!(config.sandbox.mode.is_none());
+        assert!(config.sandbox.network.is_none());
         assert!(config.proxy.domain_allowlist.is_empty());
-    }
-
-    #[test]
-    fn test_parse_sandbox_mode() {
-        let config = HaltConfig::parse("[sandbox]\nmode = \"native\"").unwrap();
-        assert_eq!(config.sandbox.mode, Some(SandboxMode::Native));
-    }
-
-    #[test]
-    fn test_parse_sandbox_mode_none() {
-        let config = HaltConfig::parse("[sandbox]\nmode = \"none\"").unwrap();
-        assert_eq!(config.sandbox.mode, Some(SandboxMode::None));
     }
 
     #[test]
@@ -305,15 +271,6 @@ mod tests {
         let config = HaltConfig::parse(toml).unwrap();
         assert_eq!(config.proxy.domain_allowlist.len(), 2);
         assert!(config.proxy.domain_allowlist.contains(&"example.com".to_string()));
-    }
-
-    #[test]
-    fn test_parse_proxy_bind_addrs() {
-        let toml =
-            "[proxy]\ndns_bind_addr = \"127.0.0.1:5353\"\nproxy_bind_addr = \"127.0.0.1:9300\"";
-        let config = HaltConfig::parse(toml).unwrap();
-        assert_eq!(config.proxy.dns_bind_addr.as_deref(), Some("127.0.0.1:5353"));
-        assert_eq!(config.proxy.proxy_bind_addr.as_deref(), Some("127.0.0.1:9300"));
     }
 
     #[test]
@@ -344,20 +301,20 @@ mod tests {
     #[test]
     fn test_merge_scalar_project_wins() {
         let global =
-            HaltConfig::parse("[sandbox]\nmode = \"native\"").unwrap();
+            HaltConfig::parse("[sandbox]\nnetwork = { mode = \"localhost_only\" }").unwrap();
         let project =
-            HaltConfig::parse("[sandbox]\nmode = \"none\"").unwrap();
+            HaltConfig::parse("[sandbox]\nnetwork = { mode = \"blocked\" }").unwrap();
         let merged = global.merge(project);
-        assert_eq!(merged.sandbox.mode, Some(SandboxMode::None));
+        assert_eq!(merged.sandbox.network, Some(NetworkMode::Blocked));
     }
 
     #[test]
     fn test_merge_scalar_global_wins_when_project_absent() {
         let global =
-            HaltConfig::parse("[sandbox]\nmode = \"native\"").unwrap();
+            HaltConfig::parse("[sandbox]\nnetwork = { mode = \"localhost_only\" }").unwrap();
         let project = HaltConfig::parse("").unwrap();
         let merged = global.merge(project);
-        assert_eq!(merged.sandbox.mode, Some(SandboxMode::Native));
+        assert_eq!(merged.sandbox.network, Some(NetworkMode::LocalhostOnly));
     }
 
     #[test]
@@ -374,11 +331,10 @@ mod tests {
 
     #[test]
     fn test_roundtrip_toml() {
-        let toml = "[sandbox]\nmode = \"native\"\n\n[proxy]\ndomain_allowlist = [\"example.com\"]\n";
+        let toml = "[proxy]\ndomain_allowlist = [\"example.com\"]\n";
         let config = HaltConfig::parse(toml).unwrap();
         let serialized = config.to_toml().unwrap();
         let reparsed = HaltConfig::parse(&serialized).unwrap();
-        assert_eq!(reparsed.sandbox.mode, Some(SandboxMode::Native));
         assert_eq!(reparsed.proxy.domain_allowlist, vec!["example.com".to_string()]);
     }
 
@@ -388,13 +344,11 @@ mod tests {
         let path = dir.path().join("halt.toml");
 
         let mut config = HaltConfig::default();
-        config.sandbox.mode = Some(SandboxMode::Native);
         config.proxy.domain_allowlist = vec!["test.local".to_string()];
 
         config.save(&path).unwrap();
 
         let loaded = HaltConfig::load(&path).unwrap();
-        assert_eq!(loaded.sandbox.mode, Some(SandboxMode::Native));
         assert_eq!(loaded.proxy.domain_allowlist, vec!["test.local".to_string()]);
     }
 

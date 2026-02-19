@@ -23,7 +23,7 @@
 //!
 
 
-use crate::{DnsServer, DnsServerConfig, Result, SharedState, TcpProxy, TcpProxyConfig};
+use crate::{DnsServer, DnsServerConfig, ProxyError, Result, SharedState, TcpProxy, TcpProxyConfig};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -32,11 +32,11 @@ use tokio::sync::oneshot;
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// DNS server bind address.
-    /// Default: `127.0.0.1:5353`
+    /// Default: `127.0.0.1:0` (loopback, OS-assigned port)
     pub dns_bind_addr: SocketAddr,
 
     /// TCP proxy bind address.
-    /// Default: `127.0.0.1:9300`
+    /// Default: `127.0.0.1:0` (loopback, OS-assigned port)
     pub proxy_bind_addr: SocketAddr,
 
     /// Upstream DNS servers.
@@ -50,17 +50,17 @@ pub struct ProxyConfig {
     /// Supports exact matches and wildcards (`*.github.com`).
     pub domain_allowlist: Vec<String>,
 
-    /// DNS response TTL in seconds.
-    /// Default: 300
-    pub dns_ttl_seconds: u32,
+    /// DNS response TTL.
+    /// Default: 5 minutes
+    pub dns_ttl: std::time::Duration,
 
-    /// TCP connection timeout in seconds.
-    /// Default: 30
-    pub tcp_connect_timeout_secs: u64,
+    /// TCP connection timeout.
+    /// Default: 30 seconds
+    pub tcp_connect_timeout: std::time::Duration,
 
-    /// TCP idle timeout in seconds.
-    /// Default: 300
-    pub tcp_idle_timeout_secs: u64,
+    /// TCP idle timeout (connection closed if no data flows).
+    /// Default: 5 minutes
+    pub tcp_idle_timeout: std::time::Duration,
 }
 
 impl Default for ProxyConfig {
@@ -70,9 +70,9 @@ impl Default for ProxyConfig {
             proxy_bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
             upstream_dns: None,       // Use system resolvers
             domain_allowlist: vec![], // Populated from settings per-assistant
-            dns_ttl_seconds: 300,
-            tcp_connect_timeout_secs: 30,
-            tcp_idle_timeout_secs: 300,
+            dns_ttl: std::time::Duration::from_secs(300),
+            tcp_connect_timeout: std::time::Duration::from_secs(30),
+            tcp_idle_timeout: std::time::Duration::from_secs(300),
         }
     }
 }
@@ -134,9 +134,9 @@ impl ProxyHandle {
     /// will complete when it receives the signal. If the shutdown signal
     /// cannot be delivered (receiver dropped), the task is aborted.
     ///
-    /// # Returns
-    /// * `Ok(())` - Server shut down gracefully
-    /// * `Err(ProxyError::Shutdown)` - Shutdown failed
+    /// # Errors
+    /// Currently infallible; always returns `Ok`. If the task does not respond
+    /// within 2 seconds it is left to finish on its own (not aborted).
     pub async fn shutdown(mut self) -> Result<()> {
         // Send shutdown signal - this triggers the tokio::select! in the server task
         let signal_sent = if let Some(tx) = self.shutdown_tx.take() {
@@ -208,9 +208,9 @@ impl ProxyServer {
     /// # Arguments
     /// * `config` - Server configuration
     ///
-    /// # Returns
-    /// * `Ok(ProxyServer)` - The configured server (not yet running)
-    /// * `Err(ProxyError)` - If configuration is invalid
+    /// # Errors
+    /// Currently infallible; always returns `Ok`. The `Result` return type
+    /// is present for forward compatibility.
     ///
     /// # Example
     /// ```ignore
@@ -229,39 +229,61 @@ impl ProxyServer {
     /// Spawns the DNS server and TCP proxy as concurrent tasks.
     /// Returns a handle for controlling the running server.
     ///
-    /// # Returns
-    /// * `Ok(ProxyHandle)` - Handle for the running server
-    /// * `Err(ProxyError::Bind)` - Failed to bind to address
+    /// # Errors
+    /// * `ProxyError::Bind` - If binding the DNS UDP socket or the TCP proxy
+    ///   listener fails (e.g. address already in use).
     pub async fn start(self) -> Result<ProxyHandle> {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        use tokio::net::{TcpListener, UdpSocket};
 
-        let dns_bind_addr = self.config.dns_bind_addr;
-        let proxy_bind_addr = self.config.proxy_bind_addr;
+        // Pre-bind sockets so actual OS-assigned ports are known immediately.
+        let tcp_listener = TcpListener::bind(self.config.proxy_bind_addr)
+            .await
+            .map_err(|e| ProxyError::Bind {
+                addr: self.config.proxy_bind_addr,
+                source: e,
+            })?;
+        let actual_proxy_addr = tcp_listener.local_addr().map_err(|e| ProxyError::Bind {
+            addr: self.config.proxy_bind_addr,
+            source: e,
+        })?;
+
+        let udp_socket = UdpSocket::bind(self.config.dns_bind_addr)
+            .await
+            .map_err(|e| ProxyError::Bind {
+                addr: self.config.dns_bind_addr,
+                source: e,
+            })?;
+        let actual_dns_addr = udp_socket.local_addr().map_err(|e| ProxyError::Bind {
+            addr: self.config.dns_bind_addr,
+            source: e,
+        })?;
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let state_for_task = Arc::clone(&self.state);
         let state_for_handle = Arc::clone(&self.state);
         let config = self.config.clone();
 
-        // Spawn server task
+        // Spawn server task using pre-bound sockets.
         let join_handle = tokio::spawn(async move {
             let dns_config = DnsServerConfig {
-                bind_addr: config.dns_bind_addr,
+                bind_addr: actual_dns_addr,
                 upstream: config.upstream_dns.clone(),
-                ttl_seconds: config.dns_ttl_seconds,
+                ttl: config.dns_ttl,
             };
             let tcp_config = TcpProxyConfig {
-                bind_addr: config.proxy_bind_addr,
-                connect_timeout_secs: config.tcp_connect_timeout_secs,
-                idle_timeout_secs: config.tcp_idle_timeout_secs,
+                bind_addr: actual_proxy_addr,
+                connect_timeout: config.tcp_connect_timeout,
+                idle_timeout: config.tcp_idle_timeout,
                 ..Default::default()
             };
 
             let dns_server = DnsServer::new(dns_config, Arc::clone(&state_for_task))?;
             let tcp_proxy = TcpProxy::new(tcp_config, Arc::clone(&state_for_task))?;
 
-            // Run both servers concurrently
+            // Run both servers concurrently on pre-bound sockets.
             tokio::select! {
-                result = dns_server.run() => result,
-                result = tcp_proxy.run() => result,
+                result = dns_server.run_on(udp_socket) => result,
+                result = tcp_proxy.run_on(tcp_listener) => result,
                 _ = shutdown_rx => Ok(()),
             }
         });
@@ -269,8 +291,8 @@ impl ProxyServer {
         Ok(ProxyHandle {
             shutdown_tx: Some(shutdown_tx),
             join_handle: Some(join_handle),
-            dns_bind_addr,
-            proxy_bind_addr,
+            dns_bind_addr: actual_dns_addr,
+            proxy_bind_addr: actual_proxy_addr,
             state: state_for_handle,
         })
     }
@@ -280,19 +302,20 @@ impl ProxyServer {
     /// Alternative to `start()` for blocking operation.
     /// Runs until a signal is received or an error occurs.
     ///
-    /// # Returns
-    /// * `Ok(())` - Server shut down gracefully
-    /// * `Err(ProxyError)` - Server error
+    /// # Errors
+    /// * `ProxyError::Bind` - If binding to the configured address fails.
+    /// * `ProxyError::Internal` - If the DNS server or TCP proxy encounter
+    ///   a fatal runtime error.
     pub async fn run(self) -> Result<()> {
         let dns_config = DnsServerConfig {
             bind_addr: self.config.dns_bind_addr,
             upstream: self.config.upstream_dns.clone(),
-            ttl_seconds: self.config.dns_ttl_seconds,
+            ttl: self.config.dns_ttl,
         };
         let tcp_config = TcpProxyConfig {
             bind_addr: self.config.proxy_bind_addr,
-            connect_timeout_secs: self.config.tcp_connect_timeout_secs,
-            idle_timeout_secs: self.config.tcp_idle_timeout_secs,
+            connect_timeout: self.config.tcp_connect_timeout,
+            idle_timeout: self.config.tcp_idle_timeout,
             ..Default::default()
         };
 
@@ -382,9 +405,9 @@ mod tests {
     #[test]
     fn test_proxy_config_default_timeouts() {
         let config = ProxyConfig::default();
-        assert_eq!(config.dns_ttl_seconds, 300);
-        assert_eq!(config.tcp_connect_timeout_secs, 30);
-        assert_eq!(config.tcp_idle_timeout_secs, 300);
+        assert_eq!(config.dns_ttl, std::time::Duration::from_secs(300));
+        assert_eq!(config.tcp_connect_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(config.tcp_idle_timeout, std::time::Duration::from_secs(300));
     }
 
     #[test]
@@ -845,7 +868,7 @@ mod tests {
             dns_bind_addr: "127.0.0.1:25368".parse().unwrap(),
             proxy_bind_addr: "127.0.0.1:29315".parse().unwrap(),
             domain_allowlist: vec!["test.local".to_string()],
-            dns_ttl_seconds: 1, // Very short TTL
+            dns_ttl: std::time::Duration::from_secs(1), // Very short TTL
             ..Default::default()
         };
         let server = ProxyServer::new(config).unwrap();
@@ -921,14 +944,9 @@ mod tests {
             ..Default::default()
         };
         let server = ProxyServer::new(config).unwrap();
-        // start() always returns Ok; the bind error surfaces in the spawned task
-        let handle = server.start().await.unwrap();
-
-        // Give the task time to attempt binding and fail
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Server task should have stopped because DNS port is in use
-        assert!(!handle.is_running(), "Server task should have exited after bind failure");
+        // start() now pre-binds before spawning; bind error surfaces immediately.
+        let result = server.start().await;
+        assert!(result.is_err(), "start() should fail when DNS port is in use");
     }
 
     #[tokio::test]
@@ -945,14 +963,9 @@ mod tests {
             ..Default::default()
         };
         let server = ProxyServer::new(config).unwrap();
-        // start() always returns Ok; the bind error surfaces in the spawned task
-        let handle = server.start().await.unwrap();
-
-        // Give the task time to attempt binding and fail
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Server task should have stopped because TCP proxy port is in use
-        assert!(!handle.is_running(), "Server task should have exited after bind failure");
+        // start() now pre-binds before spawning; bind error surfaces immediately.
+        let result = server.start().await;
+        assert!(result.is_err(), "start() should fail when proxy port is in use");
     }
 
     #[tokio::test]

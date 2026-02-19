@@ -267,6 +267,21 @@ impl DomainFilter {
         domains.push(domain);
         Self::new(domains)
     }
+
+    /// Add a domain pattern to this filter in-place.
+    ///
+    /// More efficient than [`with_domain`](Self::with_domain) for runtime additions
+    /// because it avoids cloning all existing patterns. The HashSet and Vec are
+    /// updated directly in O(1) amortized time.
+    pub fn push(&mut self, domain: String) {
+        let pattern = DomainPattern::parse(&domain);
+        if pattern.is_exact() {
+            // Index in exact_matches for O(1) lookup; the pattern also goes
+            // into self.patterns so patterns() and with_domain() see it.
+            self.exact_matches.insert(domain);
+        }
+        self.patterns.push(pattern);
+    }
 }
 
 /// Normalize a domain for matching.

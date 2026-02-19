@@ -2,6 +2,12 @@
 //!
 //! Uses Landlock for filesystem access control. Requires kernel 5.19+ (ABI v4).
 //!
+//! Network isolation is implemented via `unshare(CLONE_NEWNET)` in the child
+//! process after fork but before exec:
+//! - `LocalhostOnly` / `ProxyOnly`: new network namespace + loopback brought up
+//! - `Blocked`: new network namespace with no interfaces
+//! - `Unrestricted`: no network changes
+//!
 //! # Landlock Architecture
 //!
 //! Landlock creates a deny-all baseline for filesystem operations,
@@ -11,7 +17,7 @@
 //! Ruleset (deny-all baseline)
 //!   |
 //!   +-- Allow workspace (rw)
-//!   +-- Allow ~/.ago (rw)
+//!   +-- Allow data_dir (rw)
 //!   +-- Allow mounts (per config)
 //!   +-- Allow PATH dirs (ro+exec)
 //!   +-- Allow system libs (ro)
@@ -26,7 +32,7 @@
 //! we use `Command::pre_exec()` to apply Landlock in the child
 //! process after fork but before exec.
 
-use crate::{SandboxConfig, SandboxError};
+use crate::{NetworkMode, SandboxConfig, SandboxError};
 use std::path::{Path, PathBuf};
 
 /// Minimum required Landlock ABI version.
@@ -77,7 +83,7 @@ pub fn check_available() -> Result<(), SandboxError> {
 ///
 /// Creates deny-all baseline with explicit allows for:
 /// - Workspace directory (rw)
-/// - ~/.ago directory (rw)
+/// - data_dir directory (rw)
 /// - Mount paths (ro or rw per config)
 /// - PATH directories (ro+exec)
 /// - System libraries /usr/lib, /lib, /lib64 (ro)
@@ -141,7 +147,7 @@ pub fn build_landlock_ruleset(
     // Workspace - read/write
     add_path(&mut ruleset, &config.workspace, write_access)?;
 
-    // ~/.ago - read/write
+    // data_dir - read/write
     add_path(&mut ruleset, &config.data_dir, write_access)?;
 
     // Mounts
@@ -215,6 +221,86 @@ pub fn apply_landlock(_ruleset: ()) -> Result<(), SandboxError> {
     Err(SandboxError::UnsupportedPlatform)
 }
 
+/// Bring up the loopback interface in the current network namespace.
+///
+/// Called after `unshare(CLONE_NEWNET)` to make localhost connectivity
+/// available for `LocalhostOnly` and `ProxyOnly` modes.
+///
+/// # Safety
+/// Caller must be in a post-fork, pre-exec context (pre_exec hook) or
+/// equivalent single-threaded environment. Uses raw ioctl syscalls.
+#[cfg(target_os = "linux")]
+unsafe fn bring_up_loopback() {
+    const IFNAMSIZ: usize = 16;
+    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
+    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    const IFF_UP: i16 = 0x1;
+
+    /// Mirrors the C `struct ifreq` layout for SIOCGIFFLAGS / SIOCSIFFLAGS.
+    #[repr(C)]
+    struct IfReq {
+        ifr_name: [u8; IFNAMSIZ],
+        ifr_flags: i16,
+        _pad: [u8; 22],
+    }
+    // Compile-time check that our hand-written layout matches the expected size.
+    const _: () = assert!(std::mem::size_of::<IfReq>() == 40);
+
+    let mut req = IfReq {
+        ifr_name: [0; IFNAMSIZ],
+        ifr_flags: 0,
+        _pad: [0; 22],
+    };
+    req.ifr_name[0] = b'l';
+    req.ifr_name[1] = b'o';
+
+    let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+    if sock < 0 {
+        return;
+    }
+    libc::ioctl(sock, SIOCGIFFLAGS, &mut req as *mut IfReq as *mut libc::c_void);
+    req.ifr_flags |= IFF_UP;
+    libc::ioctl(sock, SIOCSIFFLAGS, &mut req as *mut IfReq as *mut libc::c_void);
+    libc::close(sock);
+}
+
+/// Apply network isolation to the current process for the given mode.
+///
+/// Uses `unshare(CLONE_NEWNET)` to create an anonymous network namespace.
+/// For modes requiring loopback, brings it up via ioctl.
+///
+/// # Errors
+/// Returns `io::Error` if unshare fails (e.g. insufficient privileges).
+#[cfg(target_os = "linux")]
+fn apply_network_isolation(network: &NetworkMode) -> std::io::Result<()> {
+    match network {
+        NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
+            // SAFETY: unshare(CLONE_NEWNET) creates a new network namespace for
+            // the current process. Called in a post-fork, single-threaded child.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // SAFETY: bring_up_loopback uses ioctl in a post-fork child process.
+            // Single-threaded at this point; no locks are held from the parent.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            unsafe { bring_up_loopback() };
+        }
+        NetworkMode::Blocked => {
+            // SAFETY: unshare(CLONE_NEWNET) creates a new network namespace for
+            // the current process. Called in a post-fork, single-threaded child.
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let ret = unsafe { libc::unshare(libc::CLONE_NEWNET) };
+            if ret != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        NetworkMode::Unrestricted => {}
+    }
+    Ok(())
+}
+
 /// Execute command with Landlock sandbox, replacing current process.
 ///
 /// # Arguments
@@ -226,6 +312,7 @@ pub fn apply_landlock(_ruleset: ()) -> Result<(), SandboxError> {
 ///
 /// # Errors
 /// * `SandboxUnavailable` - If Landlock unavailable or apply fails
+/// * `NetworkSetupFailed` - If network namespace setup fails
 /// * `SpawnFailed` - If exec fails
 #[cfg(target_os = "linux")]
 pub fn exec_with_landlock(
@@ -241,6 +328,9 @@ pub fn exec_with_landlock(
     // Build and apply Landlock ruleset
     let ruleset = build_landlock_ruleset(config, path_dirs)?;
     apply_landlock(ruleset)?;
+
+    // Apply network isolation
+    apply_network_isolation(&config.network).map_err(SandboxError::SpawnFailed)?;
 
     // Build command
     let mut command = Command::new(cmd);
@@ -269,8 +359,8 @@ pub fn exec_with_landlock(
 
 /// Spawn command with Landlock sandbox using pre_exec.
 ///
-/// Uses `Command::pre_exec()` to apply Landlock in the child process
-/// after fork but before exec. This restricts only the child, not parent.
+/// Uses `Command::pre_exec()` to apply Landlock and network isolation in the
+/// child process after fork but before exec. This restricts only the child.
 ///
 /// # Arguments
 /// * `config` - Sandbox configuration
@@ -304,12 +394,69 @@ pub fn spawn_with_landlock(
     let data_dir = config.data_dir.clone();
     let mounts = config.mounts.clone();
     let path_dirs = path_dirs.to_vec();
+    let network = config.network.clone();
+
+    // For ProxyOnly, create a named network namespace in the parent so the child
+    // can join it via setns() in pre_exec. A named namespace survives the child's
+    // exec and must be deleted by the caller after child.wait().
+    //
+    // The tuple holds (namespace_name, open_fd). The fd is O_CLOEXEC so it is
+    // automatically closed when the child calls exec(); the parent closes it
+    // explicitly after spawn() returns.
+    let proxy_netns: Option<(String, libc::c_int, std::net::Ipv4Addr)> =
+        if let NetworkMode::ProxyOnly { .. } = &config.network {
+            let ns_config = super::linux_netns::NetnsConfig::from_pid();
+            super::linux_netns::create_netns(&ns_config)?;
+
+            let netns_path =
+                std::ffi::CString::new(format!("/var/run/netns/{}", ns_config.name)).map_err(
+                    |e| SandboxError::NetworkSetupFailed(format!("invalid netns name: {}", e)),
+                )?;
+            // SAFETY: netns_path is a valid NUL-terminated CString. O_CLOEXEC
+            // ensures the fd is closed on exec in the child; we close it in the
+            // parent explicitly after spawn().
+            // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+            let fd =
+                unsafe { libc::open(netns_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            if fd < 0 {
+                let _ = super::linux_netns::delete_netns(&ns_config.name);
+                return Err(SandboxError::NetworkSetupFailed(format!(
+                    "failed to open /var/run/netns/{}: {}",
+                    ns_config.name,
+                    std::io::Error::last_os_error()
+                )));
+            }
+
+            Some((ns_config.name, fd, ns_config.outer_ip))
+        } else {
+            None
+        };
+
+    // fd value for the pre_exec closure (-1 when not ProxyOnly)
+    let netns_fd: libc::c_int = proxy_netns.as_ref().map_or(-1, |(_, fd, _)| *fd);
+
+    // For ProxyOnly, inject proxy env vars pointing to the veth host-side IP so
+    // the child can reach the proxy from inside the isolated namespace.
+    let effective_env: std::collections::HashMap<String, String> =
+        if let (NetworkMode::ProxyOnly { proxy_addr }, Some((_, _, outer_ip))) =
+            (&config.network, &proxy_netns)
+        {
+            let proxy_url = format!("http://{}:{}", outer_ip, proxy_addr.port());
+            let mut e = env.clone();
+            e.insert("HTTP_PROXY".to_string(), proxy_url.clone());
+            e.insert("HTTPS_PROXY".to_string(), proxy_url.clone());
+            e.insert("http_proxy".to_string(), proxy_url.clone());
+            e.insert("https_proxy".to_string(), proxy_url.clone());
+            e
+        } else {
+            env.clone()
+        };
 
     let mut command = Command::new(cmd);
     command.args(args);
     command.current_dir(&config.cwd);
     command.env_clear();
-    for (key, value) in env {
+    for (key, value) in &effective_env {
         command.env(key, value);
     }
     command.stdin(Stdio::inherit());
@@ -387,11 +534,44 @@ pub fn spawn_with_landlock(
                 .restrict_self()
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
+            // Apply network isolation
+            if netns_fd >= 0 {
+                // ProxyOnly: join the named namespace created by the parent.
+                // SAFETY: netns_fd is a valid open fd to the named netns file.
+                // setns(CLONE_NEWNET) joins the network namespace; we are in a
+                // single-threaded post-fork child, so no other threads are affected.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                let ret = unsafe { libc::setns(netns_fd, libc::CLONE_NEWNET) };
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // SAFETY: bring_up_loopback uses ioctl in a post-fork child process.
+                // Single-threaded at this point; no locks are held from the parent.
+                // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+                unsafe { bring_up_loopback() };
+            } else {
+                apply_network_isolation(&network)?;
+            }
+
             Ok(())
         });
     }
 
-    command.spawn().map_err(SandboxError::SpawnFailed)
+    let result = command.spawn().map_err(SandboxError::SpawnFailed);
+
+    // Close the netns fd in the parent; the child's copy was closed by exec (O_CLOEXEC).
+    // On spawn failure, also clean up the named namespace so it doesn't leak.
+    if let Some((ns_name, fd, _)) = proxy_netns {
+        // SAFETY: fd is a valid open file descriptor obtained from libc::open above.
+        // The child's copy was closed by exec (O_CLOEXEC); we close the parent's copy here.
+        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+        unsafe { libc::close(fd) };
+        if result.is_err() {
+            let _ = super::linux_netns::delete_netns(&ns_name);
+        }
+    }
+
+    result
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -406,9 +586,10 @@ pub fn spawn_with_landlock(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{SandboxMode, SandboxPaths};
+    use crate::SandboxPaths;
     use tempfile::TempDir;
 
     struct TestDirs {
@@ -456,8 +637,8 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn test_check_available_non_linux() {
-        // On non-Linux, should return UnsupportedPlatform
-        // This would need a stub that returns error
+        let result = check_available();
+        assert!(matches!(result, Err(SandboxError::UnsupportedPlatform)));
     }
 
     // ========================================================================
@@ -467,7 +648,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn make_test_config() -> SandboxConfig {
         SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/tmp/test-workspace"),
             SandboxPaths::default(),
             PathBuf::from("/tmp/test-workspace"),
@@ -503,6 +683,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_with_mounts() {
+        use crate::Mount;
         let config = make_test_config()
             .with_mount(Mount {
                 path: PathBuf::from("/opt/tools"),
@@ -522,7 +703,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn test_build_landlock_ruleset_skips_nonexistent_paths() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/nonexistent/workspace/12345"),
             SandboxPaths::default(),
             PathBuf::from("/tmp"),
@@ -539,7 +719,6 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn test_build_landlock_ruleset_non_linux() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/workspace"),
             SandboxPaths::default(),
             PathBuf::from("/workspace"),
@@ -581,7 +760,6 @@ mod tests {
 
         let dirs = make_test_dirs();
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),
@@ -610,7 +788,6 @@ mod tests {
 
         let dirs = make_test_dirs();
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),
@@ -645,7 +822,6 @@ mod tests {
 
         let dirs = make_test_dirs();
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             dirs.workspace.clone(),
             SandboxPaths::default(),
             dirs.workspace.clone(),

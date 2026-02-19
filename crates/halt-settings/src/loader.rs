@@ -7,7 +7,7 @@
 //! Project values take precedence for scalar fields; list fields are extended
 //! so that both global and project entries contribute.
 
-use crate::HaltConfig;
+use crate::{HaltConfig, SettingsError};
 use std::path::{Path, PathBuf};
 
 /// Loads and merges `HaltConfig` from global and project-level files.
@@ -18,19 +18,28 @@ impl ConfigLoader {
     ///
     /// Reads the global config (`~/.config/halt/halt.toml`), then the project
     /// config (`<workspace>/.halt/halt.toml`), and merges them. Missing files
-    /// are silently skipped. Parse errors emit a warning to stderr and the
-    /// file is treated as if absent.
-    pub fn load(workspace: &Path) -> HaltConfig {
-        let global = Self::load_optional(&Self::global_config_path());
-        let project = Self::load_optional(&Self::project_config_path(workspace));
-        global.merge(project)
+    /// are silently skipped. Parse errors are returned as errors.
+    ///
+    /// # Errors
+    /// Returns an error if a config file exists but cannot be parsed.
+    pub fn load(workspace: &Path) -> Result<HaltConfig, SettingsError> {
+        let global = if let Some(path) = Self::global_config_path() {
+            Self::load_file(&path)?.unwrap_or_default()
+        } else {
+            HaltConfig::default()
+        };
+        let project = Self::load_file(&Self::project_config_path(workspace))?
+            .unwrap_or_default();
+        Ok(global.merge(project))
     }
 
     /// Absolute path to the global config file.
-    pub fn global_config_path() -> PathBuf {
-        Self::global_config_dir()
-            .unwrap_or_else(|| PathBuf::from(".halt"))
-            .join("halt.toml")
+    ///
+    /// Returns `None` if the user's config directory cannot be determined
+    /// (e.g., `$HOME` is unset). Callers should treat `None` as "no global
+    /// config" rather than falling back to a relative path.
+    pub fn global_config_path() -> Option<PathBuf> {
+        Self::global_config_dir().map(|d| d.join("halt.toml"))
     }
 
     /// Absolute path to the project config file for the given workspace.
@@ -46,18 +55,15 @@ impl ConfigLoader {
         workspace.join(".halt")
     }
 
-    fn load_optional(path: &Path) -> HaltConfig {
+    /// Load a config file, returning `None` if the file does not exist.
+    ///
+    /// # Errors
+    /// Returns an error if the file exists but cannot be parsed.
+    fn load_file(path: &Path) -> Result<Option<HaltConfig>, SettingsError> {
         if !path.exists() {
-            return HaltConfig::default();
+            return Ok(None);
         }
-        match HaltConfig::load(path) {
-            Ok(config) => config,
-            Err(err) => {
-                // Warn but don't fail: a malformed config shouldn't block startup.
-                eprintln!("halt-settings: warning: failed to parse {path:?}: {err}");
-                HaltConfig::default()
-            }
-        }
+        HaltConfig::load(path).map(Some)
     }
 }
 
@@ -70,8 +76,8 @@ mod tests {
     #[test]
     fn test_load_missing_workspace_returns_default() {
         let dir = tempfile::tempdir().unwrap();
-        let config = ConfigLoader::load(dir.path());
-        assert!(config.sandbox.mode.is_none());
+        let config = ConfigLoader::load(dir.path()).unwrap();
+        assert!(config.sandbox.network.is_none());
         assert!(config.proxy.domain_allowlist.is_empty());
     }
 
@@ -82,12 +88,11 @@ mod tests {
         fs::create_dir_all(&halt_dir).unwrap();
         fs::write(
             halt_dir.join("halt.toml"),
-            "[sandbox]\nmode = \"native\"\n[proxy]\ndomain_allowlist = [\"example.com\"]\n",
+            "[proxy]\ndomain_allowlist = [\"example.com\"]\n",
         )
         .unwrap();
 
-        let config = ConfigLoader::load(dir.path());
-        assert_eq!(config.sandbox.mode, Some(crate::SandboxMode::Native));
+        let config = ConfigLoader::load(dir.path()).unwrap();
         assert_eq!(config.proxy.domain_allowlist, vec!["example.com".to_string()]);
     }
 
@@ -99,21 +104,22 @@ mod tests {
 
     #[test]
     fn test_global_config_path_ends_with_halt_toml() {
-        let path = ConfigLoader::global_config_path();
-        assert!(path.ends_with("halt.toml"));
-        assert!(path.to_string_lossy().contains("halt"));
+        // global_config_path() may be None in environments without $HOME.
+        if let Some(path) = ConfigLoader::global_config_path() {
+            assert!(path.ends_with("halt.toml"));
+            assert!(path.to_string_lossy().contains("halt"));
+        }
     }
 
     #[test]
-    fn test_load_malformed_config_falls_back_to_default() {
+    fn test_load_malformed_config_returns_error() {
         let dir = tempfile::tempdir().unwrap();
         let halt_dir = dir.path().join(".halt");
         fs::create_dir_all(&halt_dir).unwrap();
         fs::write(halt_dir.join("halt.toml"), "not valid toml :::").unwrap();
 
-        // Should not panic; should return default
-        let config = ConfigLoader::load(dir.path());
-        assert!(config.sandbox.mode.is_none());
+        let result = ConfigLoader::load(dir.path());
+        assert!(result.is_err(), "malformed config should return an error");
     }
 
     #[test]

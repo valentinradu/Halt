@@ -1,0 +1,172 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Build release binaries ────────────────────────────────────────────────
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            runner: macos-13           # Intel runner
+          - target: aarch64-apple-darwin
+            runner: macos-latest       # Apple Silicon runner
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (Linux musl targets)
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.target }}-cargo-
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: cargo build --release -p halt --target ${{ matrix.target }}
+
+      - name: Build (Linux musl via cross)
+        if: runner.os == 'Linux'
+        run: cross build --release -p halt --target ${{ matrix.target }}
+
+      - name: Package binary
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/halt
+          ARCHIVE=halt-${{ matrix.target }}.tar.gz
+          tar -czf "$ARCHIVE" -C "$(dirname "$BIN")" halt
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: halt-${{ matrix.target }}
+          path: |
+            halt-${{ matrix.target }}.tar.gz
+            halt-${{ matrix.target }}.tar.gz.sha256
+
+  # ── Create GitHub release ─────────────────────────────────────────────────
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+  # ── Update Homebrew tap ───────────────────────────────────────────────────
+  homebrew:
+    name: Update Homebrew tap
+    needs: release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download macOS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        id: shas
+        run: |
+          X86=$(cat dist/halt-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          ARM=$(cat dist/halt-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          echo "x86_sha=$X86" >> "$GITHUB_OUTPUT"
+          echo "arm_sha=$ARM" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: valentinradu/homebrew-halt
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        env:
+          TAG: ${{ github.ref_name }}
+          X86_SHA: ${{ steps.shas.outputs.x86_sha }}
+          ARM_SHA: ${{ steps.shas.outputs.arm_sha }}
+        run: |
+          VERSION="${TAG#v}"
+          cat > tap/Formula/halt.rb <<EOF
+          class Halt < Formula
+            desc "Wrap any process in a filesystem and network sandbox"
+            homepage "https://github.com/valentinradu/Halt"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "https://github.com/valentinradu/Halt/releases/download/$TAG/halt-aarch64-apple-darwin.tar.gz"
+                sha256 "$ARM_SHA"
+              else
+                url "https://github.com/valentinradu/Halt/releases/download/$TAG/halt-x86_64-apple-darwin.tar.gz"
+                sha256 "$X86_SHA"
+              end
+            end
+
+            def install
+              bin.install "halt"
+            end
+
+            test do
+              system bin/"halt", "check"
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        run: |
+          cd tap
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/halt.rb
+          git commit -m "halt ${{ github.ref_name }}"
+          git push

@@ -19,10 +19,9 @@
 //!         +-- not found --> Reject connection
 //! ```
 //!
-//! # Proxy Modes
+//! # Proxy Protocol
 //!
-//! - **SOCKS5**: Standard SOCKS5 proxy protocol (recommended)
-//! - **HTTP CONNECT**: HTTP CONNECT tunneling for HTTPS
+//! - **SOCKS5**: Standard SOCKS5 proxy protocol
 //!
 
 
@@ -39,13 +38,13 @@ pub struct TcpProxyConfig {
     /// Default: `127.0.0.1:9300`
     pub bind_addr: SocketAddr,
 
-    /// Connection timeout in seconds.
-    /// Default: 30
-    pub connect_timeout_secs: u64,
+    /// Connection timeout.
+    /// Default: 30 seconds
+    pub connect_timeout: std::time::Duration,
 
-    /// Idle timeout in seconds (connection closed if no data).
-    /// Default: 300 (5 minutes)
-    pub idle_timeout_secs: u64,
+    /// Idle timeout (connection closed if no data flows).
+    /// Default: 5 minutes
+    pub idle_timeout: std::time::Duration,
 
     /// Maximum concurrent connections.
     /// Default: 1000
@@ -56,8 +55,8 @@ impl Default for TcpProxyConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:9300".parse().expect("hardcoded loopback address"),
-            connect_timeout_secs: 30,
-            idle_timeout_secs: 300,
+            connect_timeout: std::time::Duration::from_secs(30),
+            idle_timeout: std::time::Duration::from_secs(300),
             max_connections: 1000,
         }
     }
@@ -85,9 +84,9 @@ impl TcpProxy {
     /// * `config` - Proxy configuration
     /// * `state` - Shared state containing resolution cache
     ///
-    /// # Returns
-    /// * `Ok(TcpProxy)` - The configured proxy (not yet running)
-    /// * `Err(ProxyError)` - If configuration is invalid
+    /// # Errors
+    /// Currently infallible; always returns `Ok`. The `Result` return type
+    /// is present for forward compatibility.
     pub fn new(config: TcpProxyConfig, state: Arc<SharedState>) -> Result<Self> {
         Ok(Self {
             config,
@@ -107,10 +106,9 @@ impl TcpProxy {
     /// Binds to the configured address and starts accepting connections.
     /// This method runs until the proxy is shut down.
     ///
-    /// # Returns
-    /// * `Ok(())` - Proxy shut down gracefully
-    /// * `Err(ProxyError::Bind)` - Failed to bind to address
-    /// * `Err(ProxyError::Internal)` - Proxy error
+    /// # Errors
+    /// * `ProxyError::Bind` - If binding to `config.bind_addr` fails.
+    /// * `ProxyError::Internal` - Fatal proxy error during operation.
     pub async fn run(&self) -> Result<()> {
         use tokio::net::TcpListener;
 
@@ -121,6 +119,17 @@ impl TcpProxy {
                 source: e,
             })?;
 
+        self.run_on(listener).await
+    }
+
+    /// Run the TCP proxy on a pre-bound listener.
+    ///
+    /// Used by [`crate::ProxyServer::start`] which pre-binds the listener to
+    /// obtain the actual OS-assigned port before spawning the server task.
+    ///
+    /// # Errors
+    /// * `ProxyError::Internal` - Fatal proxy error during operation.
+    pub async fn run_on(&self, listener: tokio::net::TcpListener) -> Result<()> {
         loop {
             let (client, client_addr) = match listener.accept().await {
                 Ok(result) => result,
@@ -278,8 +287,7 @@ impl TcpProxy {
     /// * `Err(ProxyError::DomainBlocked)` - IP not in resolution cache
     fn verify_destination(&self, dest: &SocketAddr) -> Result<String> {
         self.state
-            .cache
-            .lookup(&dest.ip())
+            .lookup_resolved(&dest.ip())
             .ok_or_else(|| ProxyError::DomainBlocked {
                 domain: format!("IP {} not in resolution cache", dest.ip()),
             })
@@ -294,7 +302,7 @@ impl TcpProxy {
     /// * `Ok(TcpStream)` - Connection to destination
     /// * `Err(ProxyError::TcpConnection)` - Connection failed
     async fn connect_to_destination(&self, dest: SocketAddr) -> Result<TcpStream> {
-        let timeout = std::time::Duration::from_secs(self.config.connect_timeout_secs);
+        let timeout = self.config.connect_timeout;
 
         match tokio::time::timeout(timeout, TcpStream::connect(dest)).await {
             Ok(Ok(stream)) => Ok(stream),
@@ -321,7 +329,7 @@ impl TcpProxy {
     async fn relay(&self, client: TcpStream, destination: TcpStream) -> Result<()> {
         use tokio::io::AsyncWriteExt;
 
-        let idle_timeout = std::time::Duration::from_secs(self.config.idle_timeout_secs);
+        let idle_timeout = self.config.idle_timeout;
 
         let (mut client_read, mut client_write) = client.into_split();
         let (mut dest_read, mut dest_write) = destination.into_split();
@@ -583,13 +591,13 @@ mod tests {
     fn test_tcp_proxy_config_default() {
         let config = TcpProxyConfig::default();
         assert_eq!(config.bind_addr.port(), 9300);
-        assert_eq!(config.connect_timeout_secs, 30);
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(30));
     }
 
     #[test]
     fn test_tcp_proxy_config_default_idle_timeout() {
         let config = TcpProxyConfig::default();
-        assert_eq!(config.idle_timeout_secs, 300);
+        assert_eq!(config.idle_timeout, std::time::Duration::from_secs(300));
     }
 
     #[test]
@@ -812,7 +820,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
-            connect_timeout_secs: 1, // Short timeout
+            connect_timeout: std::time::Duration::from_secs(1), // Short timeout
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();
@@ -1293,7 +1301,7 @@ mod tests {
         };
         let config = TcpProxyConfig {
             bind_addr,
-            idle_timeout_secs: 1, // 1 second idle timeout
+            idle_timeout: std::time::Duration::from_secs(1), // 1 second idle timeout
             ..Default::default()
         };
         let proxy = TcpProxy::new(config.clone(), state).unwrap();

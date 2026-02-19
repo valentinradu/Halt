@@ -1,0 +1,50 @@
+# Halt configuration for Claude Code
+#
+# Restricts Claude Code to Anthropic's API and common developer package
+# registries. Filesystem access is limited to your project directory (the
+# directory you run halt from) plus the system defaults.
+#
+# Usage:
+#   halt run --config configs/claude.toml -- claude
+#
+# Tighter usage (ignore global/project halt.toml, use only this file):
+#   halt run --no-config --config configs/claude.toml -- claude
+
+[sandbox]
+network = { mode = "proxy_only" }
+
+[proxy]
+domain_allowlist = [
+  # Anthropic API and telemetry
+  "api.anthropic.com",
+  "statsig.anthropic.com",
+  "sentry.io",
+
+  # GitHub — reading repos, cloning, downloading release assets
+  "github.com",
+  "*.github.com",
+  "raw.githubusercontent.com",
+  "objects.githubusercontent.com",
+  "codeload.github.com",
+
+  # npm (JavaScript / Node.js)
+  "registry.npmjs.org",
+  "*.npmjs.org",
+
+  # PyPI (Python)
+  "pypi.org",
+  "files.pythonhosted.org",
+
+  # crates.io (Rust)
+  "crates.io",
+  "static.crates.io",
+  "index.crates.io",
+
+  # RubyGems
+  "rubygems.org",
+
+  # Go module proxy
+  "proxy.golang.org",
+  "sum.golang.org",
+  "storage.googleapis.com",
+]

@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Background: deep blue sky top → vivid blue → sunset transition → warm orange → golden -->
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"   stop-color="#07101e"/>
+      <stop offset="26%"  stop-color="#1748b8"/>
+      <stop offset="34%"  stop-color="#c23820"/>
+      <stop offset="60%"  stop-color="#f97316"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+
+    <!-- Barrier fill: bright white-cream on the left, fading to near-transparent on the right -->
+    <linearGradient id="barrierFill" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#f4f0ff" stop-opacity="0.92"/>
+      <stop offset="45%"  stop-color="#ede5d8" stop-opacity="0.58"/>
+      <stop offset="100%" stop-color="#ffffff"  stop-opacity="0.06"/>
+    </linearGradient>
+
+    <!-- Top-edge highlight: a thin luminous line along the upper face of the barrier -->
+    <linearGradient id="edgeHighlight" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"   stop-color="#ffffff" stop-opacity="0.75"/>
+      <stop offset="55%"  stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0.00"/>
+    </linearGradient>
+
+    <!-- Soft glow applied to the barrier slab -->
+    <filter id="glow" x="-4%" y="-80%" width="108%" height="260%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Rounded-square clip -->
+    <clipPath id="clip">
+      <rect width="1024" height="1024" rx="110" ry="110"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#clip)">
+    <!-- Background gradient -->
+    <rect width="1024" height="1024" fill="url(#bg)"/>
+
+    <!--
+      Barrier slab — a diagonal tapered strip.
+
+      Left edge  (x = 0):    y from 51 to 102  → thickness ≈ 5 % of height (51 px)
+      Right edge (x = 1024): y from 333 to 343 → thickness ≈ 1 % of height (10 px)
+
+      The slab's upper face rises from 5 % height on the left to 33 % on the right,
+      creating the "cut at 33 %" visual while the left side anchors near the top corner.
+    -->
+    <g filter="url(#glow)">
+      <polygon
+        points="0,51 1024,333 1024,343 0,102"
+        fill="url(#barrierFill)"
+      />
+      <!-- Luminous top edge -->
+      <line x1="0" y1="51" x2="1024" y2="333"
+            stroke="url(#edgeHighlight)" stroke-width="2.5"
+            stroke-linecap="round"/>
+    </g>
+  </g>
+</svg>

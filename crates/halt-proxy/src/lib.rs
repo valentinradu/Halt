@@ -125,32 +125,73 @@ pub struct ResolvedAddress {
     pub expires_at: std::time::Instant,
 }
 
+/// Default maximum number of IP entries in the resolution cache.
+const DEFAULT_MAX_CACHE_ENTRIES: usize = 4096;
+
 /// Cache of resolved domains.
 ///
 /// Maps IP addresses back to domains for TCP proxy validation.
 /// Entries expire based on DNS TTL.
+///
+/// The cache is bounded by `max_entries`. On insert, expired entries are
+/// evicted first; if the cache is still full, the oldest-by-insertion-time
+/// entries are evicted until there is room.
 pub struct ResolutionCache {
-    /// Map from IP address to resolved domain info.
-    entries: std::sync::RwLock<std::collections::HashMap<std::net::IpAddr, ResolvedAddress>>,
+    /// Map from IP address to `(resolved info, insertion time)`.
+    entries: std::sync::RwLock<
+        std::collections::HashMap<std::net::IpAddr, (ResolvedAddress, std::time::Instant)>,
+    >,
+    /// Maximum number of IP entries to retain.
+    max_entries: usize,
 }
 
 impl ResolutionCache {
-    /// Create a new empty cache.
+    /// Create a new empty cache with the default capacity limit.
     pub fn new() -> Self {
+        Self::new_with_max(DEFAULT_MAX_CACHE_ENTRIES)
+    }
+
+    /// Create a new empty cache with a custom capacity limit.
+    pub fn new_with_max(max_entries: usize) -> Self {
         Self {
             entries: std::sync::RwLock::new(std::collections::HashMap::new()),
+            max_entries,
         }
     }
 
     /// Insert a resolved address into the cache.
+    ///
+    /// Evicts expired entries first, then evicts the oldest-by-insertion-time
+    /// entries if the cache is still at capacity.
     ///
     /// # Arguments
     /// * `resolved` - The resolved address to cache
     pub fn insert(&self, resolved: ResolvedAddress) {
         // Use unwrap_or_else to recover from poisoned lock - the data is still valid
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+
+        // 1. Evict expired entries
+        entries.retain(|_, (r, _)| r.expires_at > now);
+
+        // 2. If still at or over capacity, evict oldest-by-insertion-time
+        while !entries.is_empty()
+            && entries.len() + resolved.addresses.len() > self.max_entries
+        {
+            if let Some(&oldest_ip) = entries
+                .iter()
+                .min_by_key(|(_, (_, inserted_at))| *inserted_at)
+                .map(|(ip, _)| ip)
+            {
+                entries.remove(&oldest_ip);
+            } else {
+                break;
+            }
+        }
+
+        // 3. Insert new entries
         for addr in &resolved.addresses {
-            entries.insert(*addr, resolved.clone());
+            entries.insert(*addr, (resolved.clone(), now));
         }
     }
 
@@ -164,7 +205,7 @@ impl ResolutionCache {
     pub fn lookup(&self, addr: &std::net::IpAddr) -> Option<String> {
         // Use unwrap_or_else to recover from poisoned lock - the data is still valid
         let entries = self.entries.read().unwrap_or_else(|e| e.into_inner());
-        entries.get(addr).and_then(|resolved| {
+        entries.get(addr).and_then(|(resolved, _)| {
             if resolved.expires_at > std::time::Instant::now() {
                 Some(resolved.domain.clone())
             } else {
@@ -178,7 +219,7 @@ impl ResolutionCache {
         let now = std::time::Instant::now();
         // Use unwrap_or_else to recover from poisoned lock - the data is still valid
         let mut entries = self.entries.write().unwrap_or_else(|e| e.into_inner());
-        entries.retain(|_, resolved| resolved.expires_at > now);
+        entries.retain(|_, (resolved, _)| resolved.expires_at > now);
     }
 
     /// Returns true if the cache is empty.
@@ -212,7 +253,7 @@ pub struct SharedState {
     filter: std::sync::RwLock<DomainFilter>,
 
     /// Cache of resolved addresses.
-    pub cache: ResolutionCache,
+    pub(crate) cache: ResolutionCache,
 }
 
 impl SharedState {
@@ -238,11 +279,28 @@ impl SharedState {
 
     /// Add a domain to the allowlist.
     ///
-    /// Creates a new filter with the added domain and replaces the current one.
+    /// Mutates the filter in-place in O(1) amortized time.
     pub fn add_domain(&self, domain: String) {
         // Use unwrap_or_else to recover from poisoned lock - the data is still valid
         let mut filter = self.filter.write().unwrap_or_else(|e| e.into_inner());
-        *filter = filter.with_domain(domain);
+        filter.push(domain);
+    }
+
+    /// Insert a resolved address into the cache.
+    ///
+    /// This is the canonical way for the DNS server to populate the cache.
+    /// The DNS server has already verified the domain is allowed before calling this.
+    pub fn insert_resolved(&self, resolved: ResolvedAddress) {
+        self.cache.insert(resolved);
+    }
+
+    /// Look up a cached domain for a given IP address.
+    ///
+    /// Returns the domain name if the IP was resolved through the DNS server
+    /// and the cache entry has not expired. Used by the TCP proxy to verify
+    /// that a destination IP came from an allowed domain.
+    pub fn lookup_resolved(&self, addr: &std::net::IpAddr) -> Option<String> {
+        self.cache.lookup(addr)
     }
 
     /// Get the current allowlist patterns.
@@ -534,6 +592,71 @@ mod tests {
     }
 
     /// Verify that cache handles poisoning gracefully (control test).
+    #[test]
+    fn test_resolution_cache_evicts_when_full() {
+        // Create a cache that holds at most 2 entries
+        let cache = ResolutionCache::new_with_max(2);
+
+        let make_resolved = |suffix: u8, secs: u64| ResolvedAddress {
+            domain: format!("d{}.com", suffix),
+            addresses: vec![format!("1.2.3.{}", suffix).parse().unwrap()],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(secs),
+        };
+
+        // Fill cache to capacity
+        cache.insert(make_resolved(1, 300));
+        cache.insert(make_resolved(2, 300));
+        assert_eq!(cache.len(), 2);
+
+        // Inserting a third should evict the oldest
+        cache.insert(make_resolved(3, 300));
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_resolution_cache_evicts_expired_before_oldest() {
+        // When inserting into a full cache, expired entries are evicted first,
+        // even if they were inserted after other (still-valid) entries.
+        let cache = ResolutionCache::new_with_max(2);
+
+        // long_ttl is inserted first (oldest by insertion time)
+        let long_ttl = ResolvedAddress {
+            domain: "old.com".to_string(),
+            addresses: vec!["1.2.3.1".parse().unwrap()],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        };
+        // short_ttl is inserted second but has a very short TTL
+        let short_ttl = ResolvedAddress {
+            domain: "short.com".to_string(),
+            addresses: vec!["1.2.3.2".parse().unwrap()],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_millis(10),
+        };
+        cache.insert(long_ttl);
+        cache.insert(short_ttl);
+        assert_eq!(cache.len(), 2);
+
+        // Wait for short_ttl to expire
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // Insert a new entry into the full cache.
+        // The expired short_ttl entry should be evicted, not the older long_ttl.
+        let new_entry = ResolvedAddress {
+            domain: "new.com".to_string(),
+            addresses: vec!["1.2.3.3".parse().unwrap()],
+            expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
+        };
+        cache.insert(new_entry);
+        assert_eq!(cache.len(), 2);
+
+        // old.com (long_ttl, inserted first) should still be accessible
+        let ip_old: std::net::IpAddr = "1.2.3.1".parse().unwrap();
+        assert_eq!(cache.lookup(&ip_old), Some("old.com".to_string()));
+
+        // short.com should be gone (it expired)
+        let ip_short: std::net::IpAddr = "1.2.3.2".parse().unwrap();
+        assert_eq!(cache.lookup(&ip_short), None);
+    }
+
     #[test]
     fn test_resolution_cache_handles_poisoning() {
         use std::sync::Arc;

@@ -44,6 +44,28 @@ pub fn check_available() -> Result<(), SandboxError> {
     }
 }
 
+/// Validate that a path does not contain SBPL control characters.
+///
+/// SBPL uses `(`, `)`, `;`, and `*` as structural characters. A path
+/// containing any of these would allow an attacker to inject arbitrary
+/// rules into the generated sandbox profile.
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if the path contains a forbidden character.
+fn validate_path_for_sbpl(path: &Path) -> Result<(), SandboxError> {
+    let s = path.to_string_lossy();
+    for ch in ['(', ')', ';', '*'] {
+        if s.contains(ch) {
+            return Err(SandboxError::InvalidConfig(format!(
+                "Path {:?} contains SBPL control character {:?}; \
+                 refusing to include it in the sandbox profile to prevent rule injection",
+                path, ch
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Generate SBPL profile string for the given config.
 ///
 /// Uses `(allow default)` baseline with selective denies, then allows
@@ -54,54 +76,72 @@ pub fn check_available() -> Result<(), SandboxError> {
 ///
 /// # Returns
 /// SBPL profile as a String
-pub fn generate_sbpl_profile(config: &SandboxConfig) -> String {
+///
+/// # Errors
+/// Returns `SandboxError::InvalidConfig` if any user-supplied path contains
+/// SBPL control characters (`(`, `)`, `;`, `*`) that would allow profile injection.
+pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxError> {
     let mut profile = String::new();
 
-    // Header - use allow default as baseline, then selectively deny
+    // Header - use allow default as baseline, then selectively deny.
+    //
+    // We deny file-read-data (file content) globally and re-allow it only for
+    // paths the process is permitted to read.  Crucially, we do NOT deny
+    // file-read-metadata (stat/lstat/access) globally: the macOS DNS resolution
+    // stack (getaddrinfo → mDNSResponder / Network Extension) calls stat() on
+    // paths outside the allowlist (VPN sockets, network config databases, etc.)
+    // and needs file-read-metadata to succeed everywhere.  Denying all of
+    // file-read* broke DNS for every program that uses getaddrinfo().
     profile.push_str("(version 1)\n");
     profile.push_str("(allow default)\n");
-    profile.push_str("(deny file-read*)\n");
+    profile.push_str("(deny file-read-data)\n");
     profile.push_str("(deny file-write*)\n");
 
     // Expand paths from config
     let (traversal, read, read_write) = config.paths.expand_paths();
 
     // =========================================================================
-    // TRAVERSAL PATHS - literal access for path resolution
+    // TRAVERSAL PATHS - allow reading the directory entry itself
     // =========================================================================
     for path in &traversal {
+        validate_path_for_sbpl(path)?;
         let escaped = escape_sbpl_path(path);
-        profile.push_str(&format!("(allow file-read* (literal \"{}\"))\n", escaped));
+        profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", escaped));
     }
 
     // Add workspace parent directories for realpath traversal
     let mut parent = config.workspace.parent();
     while let Some(p) = parent {
         let canonical = canonicalize_for_sbpl(p);
-        profile.push_str(&format!("(allow file-read* (literal \"{}\"))\n", canonical));
+        profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", canonical));
         parent = p.parent();
     }
 
     // =========================================================================
-    // READ PATHS - subpath read access
+    // READ PATHS - subpath content access
     // =========================================================================
     for path in &read {
-        add_sbpl_path_rule(&mut profile, path, "file-read*");
+        validate_path_for_sbpl(path)?;
+        add_sbpl_path_rule(&mut profile, path, "file-read-data");
     }
 
     // =========================================================================
-    // READ-WRITE PATHS - subpath read and write access
+    // READ-WRITE PATHS - subpath content and write access
     // =========================================================================
     for path in &read_write {
-        add_sbpl_path_rule(&mut profile, path, "file-read* file-write*");
+        validate_path_for_sbpl(path)?;
+        add_sbpl_path_rule(&mut profile, path, "file-read-data file-write*");
     }
 
-    // Workspace - always read/write
-    add_sbpl_path_rule(&mut profile, &config.workspace, "file-read* file-write*");
+    // Workspace - always read/write (validated as user-supplied input)
+    validate_path_for_sbpl(&config.workspace)?;
+    add_sbpl_path_rule(&mut profile, &config.workspace, "file-read-data file-write*");
 
     // TMPDIR if set
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
-        add_sbpl_path_rule(&mut profile, Path::new(&tmpdir), "file-read* file-write*");
+        let tmpdir_path = Path::new(&tmpdir).to_path_buf();
+        validate_path_for_sbpl(&tmpdir_path)?;
+        add_sbpl_path_rule(&mut profile, &tmpdir_path, "file-read-data file-write*");
     }
 
     // =========================================================================
@@ -113,7 +153,7 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> String {
         profile.push('\n');
     }
 
-    profile
+    Ok(profile)
 }
 
 /// Generate SBPL network rules based on NetworkMode.
@@ -130,10 +170,14 @@ fn generate_network_rules(mode: &NetworkMode) -> String {
             String::new()
         }
         NetworkMode::LocalhostOnly | NetworkMode::ProxyOnly { .. } => {
-            // Deny all network, then allow localhost only
+            // Deny all network, then allow only loopback.
+            // network-outbound to remote localhost: allows TCP/UDP connects to 127.x
+            // network-bind to local localhost: allows binding loopback server sockets
+            // (local ip "localhost:*") is intentionally omitted — on recent macOS it
+            // matches unbound outbound sockets (local addr 0.0.0.0) and would leak.
             r#"(deny network*)
-(allow network* (local ip "localhost:*"))
-(allow network* (remote ip "localhost:*"))"#
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-bind (local ip "localhost:*"))"#
                 .to_string()
         }
         NetworkMode::Blocked => {
@@ -318,7 +362,7 @@ pub fn spawn_with_sandbox(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{SandboxMode, SandboxPaths};
+    use crate::SandboxPaths;
     use std::net::SocketAddr;
 
     // ========================================================================
@@ -445,36 +489,33 @@ mod tests {
     #[test]
     fn test_sbpl_profile_has_version() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             "/workspace".into(),
             make_test_paths(),
             "/workspace".into(),
         );
-        let profile = generate_sbpl_profile(&config);
+        let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(version 1)"));
     }
 
     #[test]
     fn test_sbpl_profile_has_allow_default() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             "/workspace".into(),
             make_test_paths(),
             "/workspace".into(),
         );
-        let profile = generate_sbpl_profile(&config);
+        let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(allow default)"));
     }
 
     #[test]
     fn test_sbpl_profile_allows_workspace() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             "/my/workspace".into(),
             make_test_paths(),
             "/my/workspace".into(),
         );
-        let profile = generate_sbpl_profile(&config);
+        let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("/my/workspace"));
     }
 
@@ -486,25 +527,66 @@ mod tests {
             read_write: vec![],
         };
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             "/workspace".into(),
             paths,
             "/workspace".into(),
         );
-        let profile = generate_sbpl_profile(&config);
+        let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(literal \"/custom/traversal\")"));
     }
 
     #[test]
     fn test_sbpl_profile_includes_network_rules_when_blocked() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             "/workspace".into(),
             make_test_paths(),
             "/workspace".into(),
         )
         .with_network(NetworkMode::Blocked);
-        let profile = generate_sbpl_profile(&config);
+        let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(deny network*)"));
+    }
+
+    #[test]
+    fn test_sbpl_profile_rejects_path_with_parenthesis() {
+        let paths = SandboxPaths {
+            traversal: vec!["/bad) (deny network*) (allow file-read* (subpath \"/".to_string()],
+            read: vec![],
+            read_write: vec![],
+        };
+        let config = SandboxConfig::new(
+            "/workspace".into(),
+            paths,
+            "/workspace".into(),
+        );
+        let result = generate_sbpl_profile(&config);
+        assert!(result.is_err(), "Path with SBPL control characters should be rejected");
+    }
+
+    #[test]
+    fn test_sbpl_profile_rejects_path_with_glob() {
+        let paths = SandboxPaths {
+            traversal: vec![],
+            read: vec!["/path/with/*/wildcard".to_string()],
+            read_write: vec![],
+        };
+        let config = SandboxConfig::new(
+            "/workspace".into(),
+            paths,
+            "/workspace".into(),
+        );
+        let result = generate_sbpl_profile(&config);
+        assert!(result.is_err(), "Path with * should be rejected");
+    }
+
+    #[test]
+    fn test_sbpl_profile_rejects_workspace_with_semicolon() {
+        let config = SandboxConfig::new(
+            "/bad;workspace".into(),
+            make_test_paths(),
+            "/bad;workspace".into(),
+        );
+        let result = generate_sbpl_profile(&config);
+        assert!(result.is_err(), "Workspace path with ; should be rejected");
     }
 }

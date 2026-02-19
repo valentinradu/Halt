@@ -1,6 +1,6 @@
 //! Sandbox configuration types.
 
-use crate::{Mount, NetworkMode, SandboxMode, SandboxPaths};
+use crate::{Mount, NetworkMode, SandboxPaths};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -9,9 +9,6 @@ use std::path::PathBuf;
 /// Specifies filesystem access, network mode, environment, and working directory.
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
-    /// Sandbox mode (Native or None).
-    pub mode: SandboxMode,
-
     /// Workspace directory — always granted read-write access.
     pub workspace: PathBuf,
 
@@ -41,13 +38,11 @@ impl SandboxConfig {
     /// Create a new sandbox config with default network mode (`LocalhostOnly`).
     ///
     /// # Arguments
-    /// * `mode` - Sandbox mode
     /// * `workspace` - Workspace directory (read-write)
     /// * `paths` - Sandbox filesystem paths (macOS SBPL)
     /// * `cwd` - Working directory
-    pub fn new(mode: SandboxMode, workspace: PathBuf, paths: SandboxPaths, cwd: PathBuf) -> Self {
+    pub fn new(workspace: PathBuf, paths: SandboxPaths, cwd: PathBuf) -> Self {
         Self {
-            mode,
             data_dir: workspace.clone(),
             workspace,
             paths,
@@ -90,13 +85,11 @@ mod tests {
     #[test]
     fn test_sandbox_config_new() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/workspace"),
             SandboxPaths::default(),
             PathBuf::from("/workspace"),
         );
 
-        assert_eq!(config.mode, SandboxMode::Native);
         assert_eq!(config.workspace, PathBuf::from("/workspace"));
         assert_eq!(config.network, NetworkMode::LocalhostOnly);
     }
@@ -113,7 +106,6 @@ mod tests {
         };
 
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/workspace"),
             paths,
             PathBuf::from("/workspace"),
@@ -129,7 +121,6 @@ mod tests {
     #[test]
     fn test_sandbox_config_with_data_dir() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/workspace"),
             SandboxPaths::default(),
             PathBuf::from("/workspace"),
@@ -142,7 +133,6 @@ mod tests {
     #[test]
     fn test_sandbox_config_with_mount() {
         let config = SandboxConfig::new(
-            SandboxMode::Native,
             PathBuf::from("/workspace"),
             SandboxPaths::default(),
             PathBuf::from("/workspace"),
