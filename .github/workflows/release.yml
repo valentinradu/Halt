@@ -100,13 +100,19 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-  # ── Update Homebrew tap ───────────────────────────────────────────────────
+  # ── Update Homebrew formula in this repo ─────────────────────────────────
   homebrew:
-    name: Update Homebrew tap
+    name: Update Homebrew formula
     needs: release
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
         with:
@@ -116,26 +122,25 @@ jobs:
       - name: Compute SHA256 sums
         id: shas
         run: |
-          X86=$(cat dist/halt-x86_64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
-          ARM=$(cat dist/halt-aarch64-apple-darwin.tar.gz.sha256 | awk '{print $1}')
+          X86=$(awk '{print $1}' dist/halt-x86_64-apple-darwin.tar.gz.sha256)
+          ARM=$(awk '{print $1}' dist/halt-aarch64-apple-darwin.tar.gz.sha256)
           echo "x86_sha=$X86" >> "$GITHUB_OUTPUT"
           echo "arm_sha=$ARM" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout homebrew tap
-        uses: actions/checkout@v4
-        with:
-          repository: valentinradu/homebrew-halt
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          path: tap
-
-      - name: Update formula
+      - name: Update Formula/halt.rb
         env:
           TAG: ${{ github.ref_name }}
           X86_SHA: ${{ steps.shas.outputs.x86_sha }}
           ARM_SHA: ${{ steps.shas.outputs.arm_sha }}
         run: |
           VERSION="${TAG#v}"
-          cat > tap/Formula/halt.rb <<EOF
+          cat > Formula/halt.rb <<EOF
+          # Homebrew formula for halt.
+          #
+          # To install:
+          #   brew tap valentinradu/halt https://github.com/valentinradu/Halt
+          #   brew install halt
+
           class Halt < Formula
             desc "Wrap any process in a filesystem and network sandbox"
             homepage "https://github.com/valentinradu/Halt"
@@ -164,9 +169,8 @@ jobs:
 
       - name: Commit and push formula
         run: |
-          cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/halt.rb
-          git commit -m "halt ${{ github.ref_name }}"
+          git commit -m "chore: update Homebrew formula for ${{ github.ref_name }}"
           git push

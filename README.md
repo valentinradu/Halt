@@ -71,7 +71,8 @@ cargo install --path crates/halt
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew install valentinradu/halt/halt
+brew tap valentinradu/halt https://github.com/valentinradu/Halt
+brew install halt
 ```
 
 ### AUR (Arch Linux)

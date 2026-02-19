@@ -1,11 +1,7 @@
 # Homebrew formula for halt.
 #
-# This file is kept here as a reference template. The release workflow
-# writes the final version (with correct URLs and SHA256 sums) directly
-# into the homebrew-halt tap repository.
-#
-# To install via tap:
-#   brew tap valentinradu/halt
+# To install:
+#   brew tap valentinradu/halt https://github.com/valentinradu/Halt
 #   brew install halt
 
 class Halt < Formula
