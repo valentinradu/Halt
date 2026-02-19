@@ -19,7 +19,7 @@ jobs:
       matrix:
         include:
           - target: x86_64-apple-darwin
-            runner: macos-13           # Intel runner
+            runner: macos-latest       # cross-compile from Apple Silicon
           - target: aarch64-apple-darwin
             runner: macos-latest       # Apple Silicon runner
           - target: x86_64-unknown-linux-musl
