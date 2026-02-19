@@ -125,6 +125,24 @@ pub struct ResolvedAddress {
     pub expires_at: std::time::Instant,
 }
 
+/// Kind of sandbox network violation.
+#[derive(Debug, Clone)]
+pub enum ViolationKind {
+    /// A DNS query for a domain not in the allowlist was made.
+    DnsBlocked,
+    /// A TCP connection to an IP not resolved through proxy DNS was attempted.
+    TcpBlocked,
+}
+
+/// A sandbox network violation event, emitted when the proxy blocks an access.
+#[derive(Debug, Clone)]
+pub struct ViolationEvent {
+    /// The blocked domain name or IP address.
+    pub target: String,
+    /// Kind of violation.
+    pub kind: ViolationKind,
+}
+
 /// Default maximum number of IP entries in the resolution cache.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 4096;
 
@@ -254,6 +272,9 @@ pub struct SharedState {
 
     /// Cache of resolved addresses.
     pub(crate) cache: ResolutionCache,
+
+    /// Optional channel for reporting policy violations in strict mode.
+    violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl SharedState {
@@ -262,9 +283,25 @@ impl SharedState {
     /// # Arguments
     /// * `allowlist` - List of allowed domains (supports wildcards like `*.github.com`)
     pub fn new(allowlist: Vec<String>) -> Self {
+        Self::with_violation_tx(allowlist, None)
+    }
+
+    /// Create new shared state, optionally wiring up a violation channel.
+    pub fn with_violation_tx(
+        allowlist: Vec<String>,
+        violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Self {
         Self {
             filter: std::sync::RwLock::new(DomainFilter::new(allowlist)),
             cache: ResolutionCache::new(),
+            violation_tx,
+        }
+    }
+
+    /// Report a policy violation if a violation channel is configured.
+    pub fn report_violation(&self, message: String) {
+        if let Some(tx) = &self.violation_tx {
+            let _ = tx.send(message);
         }
     }
 

@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use halt_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
+#[cfg(target_os = "macos")]
+use halt_sandbox::monitor_file_violations;
 use halt_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
 use halt_settings::{ConfigLoader, HaltConfig, SandboxPaths};
 
@@ -12,17 +14,17 @@ use crate::cli::{NetworkModeArg, RunArgs};
 use crate::error::CliError;
 
 pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
-    // 1. Load and merge config
+    // 1. Load and merge config.
+    // --no-config skips global/project config files but --config <extra> still applies.
     let mut config = if args.no_config {
         HaltConfig::default()
     } else {
-        let mut c = ConfigLoader::load(&cwd)?;
-        if let Some(ref extra) = args.extra_config {
-            let extra_cfg = HaltConfig::load(extra)?;
-            c = c.merge(extra_cfg);
-        }
-        c
+        ConfigLoader::load(&cwd)?
     };
+    if let Some(ref extra) = args.extra_config {
+        let extra_cfg = HaltConfig::load(extra)?;
+        config = config.merge(extra_cfg);
+    }
 
     // 2. Merge CLI overrides into config
     config.sandbox.paths.traversal.extend(
@@ -85,9 +87,18 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         env_map.insert(k, v);
     }
 
-    // 4. Start proxy if needed
+    // 4. Set up optional strict-mode violation channel (shared by proxy + filesystem monitor).
+    let (strict_tx, strict_rx) = if args.strict {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
+    // 5. Start proxy if needed.
     let (resolved_network, proxy_handle): (NetworkMode, Option<ProxyHandle>) = if wants_proxy {
-        let proxy_config = build_proxy_config(&config.proxy)?;
+        let mut proxy_config = build_proxy_config(&config.proxy)?;
+        proxy_config.violation_tx = strict_tx.clone();
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();
         (NetworkMode::ProxyOnly { proxy_addr }, Some(handle))
@@ -107,7 +118,8 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 
     let mut sandbox_cfg = SandboxConfig::new(cwd.clone(), merged_paths, cwd)
         .with_network(resolved_network)
-        .with_env(env_map);
+        .with_env(env_map)
+        .with_strict(args.strict);
 
     if let Some(data_dir) = args.data_dir {
         sandbox_cfg = sandbox_cfg.with_data_dir(data_dir);
@@ -128,7 +140,49 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let cmd_args: Vec<String> = cmd_parts[1..].to_vec();
 
     let mut child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
-    let exit_status = child.wait()?;
+    let child_pid = child.id();
+
+    // In strict mode, start filesystem violation monitor and wait for either
+    // the child to exit or a violation to be reported.
+    let exit_status = if let Some(mut violation_rx) = strict_rx {
+        // macOS: stream sandbox log for file-access violations into the same channel.
+        #[cfg(target_os = "macos")]
+        if let Some(fs_tx) = strict_tx {
+            monitor_file_violations(child_pid, fs_tx);
+        }
+
+        // Wait for child exit or violation, whichever comes first.
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let status = child.wait().unwrap_or_else(|_| {
+                // Safety: ExitStatus is not directly constructable; use a sentinel.
+                std::process::Command::new("true").status().unwrap()
+            });
+            let _ = done_tx.send(status);
+        });
+
+        tokio::select! {
+            biased; // Check violations before child exit so fast-exiting processes don't hide them.
+            Some(violation) = violation_rx.recv() => {
+                #[cfg(unix)]
+                // SAFETY: kill on the main thread, after all setup, before exit.
+                unsafe { libc::kill(child_pid as libc::pid_t, libc::SIGTERM); }
+                print_violation(&violation);
+                std::process::exit(2);
+            }
+            Ok(status) = &mut done_rx => {
+                // Child exited — yield once so any in-flight violation sends can land.
+                tokio::task::yield_now().await;
+                if let Ok(violation) = violation_rx.try_recv() {
+                    print_violation(&violation);
+                    std::process::exit(2);
+                }
+                status
+            }
+        }
+    } else {
+        child.wait()?
+    };
 
     // Clean up the named network namespace that was created for ProxyOnly mode.
     if needs_netns_cleanup {
@@ -154,6 +208,51 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     }
 
     std::process::exit(exit_status.code().unwrap_or(1));
+}
+
+fn print_violation(violation: &str) {
+    eprintln!();
+    eprintln!("halt: [VIOLATION] {violation}");
+    let fix = if violation.starts_with("network: DNS query for") {
+        // Extract domain from: network: DNS query for "domain" blocked ...
+        if let Some(start) = violation.find('"') {
+            if let Some(end) = violation[start + 1..].find('"') {
+                let domain = &violation[start + 1..start + 1 + end];
+                format!(
+                    "add \"{domain}\" to [proxy.domain_allowlist] in your halt config"
+                )
+            } else {
+                "add the domain to [proxy.domain_allowlist] in your halt config".to_string()
+            }
+        } else {
+            "add the domain to [proxy.domain_allowlist] in your halt config".to_string()
+        }
+    } else if violation.starts_with("network:") {
+        "verify the process uses DNS resolution and the target domain is in [proxy.domain_allowlist]".to_string()
+    } else if violation.starts_with("filesystem:") {
+        // Extract path from: filesystem: "proc" was denied "op" access to "/path"
+        if let Some(path_start) = violation.rfind('"') {
+            if path_start + 1 < violation.len() {
+                let after = &violation[..path_start];
+                if let Some(path_open) = after.rfind('"') {
+                    let path = &violation[path_open + 1..path_start];
+                    format!(
+                        "add \"{path}\" to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config"
+                    )
+                } else {
+                    "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
+                }
+            } else {
+                "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
+            }
+        } else {
+            "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
+        }
+    } else {
+        "review your halt config".to_string()
+    };
+    eprintln!("halt: fix: {fix}");
+    eprintln!("halt: sandboxed process killed (exit 2).");
 }
 
 fn build_proxy_config(

@@ -50,9 +50,19 @@ pub enum NetworkMode {
     #[default]
     LocalhostOnly,
     /// Route all traffic through a local proxy at the given address.
-    ProxyOnly { proxy_addr: std::net::SocketAddr },
+    ///
+    /// `proxy_addr` is assigned at runtime when the proxy server starts;
+    /// it is not read from or written to config files.
+    ProxyOnly {
+        #[serde(skip, default = "default_proxy_addr")]
+        proxy_addr: std::net::SocketAddr,
+    },
     /// No network access at all.
     Blocked,
+}
+
+fn default_proxy_addr() -> std::net::SocketAddr {
+    std::net::SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
 /// Filesystem paths made available to the sandboxed process.
@@ -277,11 +287,13 @@ mod tests {
 
     #[test]
     fn test_parse_network_proxy_only() {
-        let toml =
-            "[sandbox.network]\nmode = \"proxy_only\"\nproxy_addr = \"127.0.0.1:9300\"";
+        // proxy_addr is a runtime detail — not read from config files.
+        let toml = "[sandbox.network]\nmode = \"proxy_only\"";
         let config = HaltConfig::parse(toml).unwrap();
-        let addr: std::net::SocketAddr = "127.0.0.1:9300".parse().unwrap();
-        assert_eq!(config.sandbox.network, Some(NetworkMode::ProxyOnly { proxy_addr: addr }));
+        assert!(
+            matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. })),
+            "Expected ProxyOnly variant"
+        );
     }
 
     #[test]

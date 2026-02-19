@@ -61,6 +61,11 @@ pub struct ProxyConfig {
     /// TCP idle timeout (connection closed if no data flows).
     /// Default: 5 minutes
     pub tcp_idle_timeout: std::time::Duration,
+
+    /// Optional channel for reporting policy violations in strict mode.
+    /// When set, blocked DNS queries and rejected TCP connections send a
+    /// human-readable message on this channel.
+    pub violation_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl Default for ProxyConfig {
@@ -70,6 +75,7 @@ impl Default for ProxyConfig {
             proxy_bind_addr: "127.0.0.1:0".parse().expect("hardcoded loopback address"),
             upstream_dns: None,       // Use system resolvers
             domain_allowlist: vec![], // Populated from settings per-assistant
+            violation_tx: None,
             dns_ttl: std::time::Duration::from_secs(300),
             tcp_connect_timeout: std::time::Duration::from_secs(30),
             tcp_idle_timeout: std::time::Duration::from_secs(300),
@@ -220,7 +226,10 @@ impl ProxyServer {
     /// handle.shutdown().await?;
     /// ```
     pub fn new(config: ProxyConfig) -> Result<Self> {
-        let state = Arc::new(SharedState::new(config.domain_allowlist.clone()));
+        let state = Arc::new(SharedState::with_violation_tx(
+            config.domain_allowlist.clone(),
+            config.violation_tx.clone(),
+        ));
         Ok(Self { config, state })
     }
 

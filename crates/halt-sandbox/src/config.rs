@@ -32,6 +32,11 @@ pub struct SandboxConfig {
 
     /// Working directory for the process.
     pub cwd: PathBuf,
+
+    /// Strict mode: report sandbox violations via the system log and kill the
+    /// process on the first violation.  On macOS this adds `(with report)` to
+    /// the SBPL deny rules so denials appear in `log stream`.
+    pub strict: bool,
 }
 
 impl SandboxConfig {
@@ -50,7 +55,14 @@ impl SandboxConfig {
             env: HashMap::new(),
             network: NetworkMode::default(),
             cwd,
+            strict: false,
         }
+    }
+
+    /// Enable or disable strict mode.
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Set the environment variables.

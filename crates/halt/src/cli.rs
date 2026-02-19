@@ -61,6 +61,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_config: bool,
 
+    /// Kill the process and log a readable error on any sandbox or proxy violation
+    #[arg(long)]
+    pub strict: bool,
+
     /// Command and arguments to run inside the sandbox
     #[arg(trailing_var_arg = true, required = true, value_name = "COMMAND")]
     pub command: Vec<String>,

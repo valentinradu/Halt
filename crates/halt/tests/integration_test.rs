@@ -583,6 +583,201 @@ fn test_run_no_config_ignores_project_config() {
 // ============================================================================
 // H. Run — extra config file via --config flag
 // ============================================================================
+// (existing tests follow)
+
+// ============================================================================
+// I. Example config file content validation (no sandbox required)
+// ============================================================================
+
+/// Absolute path to the `configs/` directory at the workspace root.
+fn configs_dir() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../configs")
+        .canonicalize()
+        .expect("configs/ directory should exist at workspace root")
+}
+
+/// Copy an example config as the project config and return the effective
+/// configuration as parsed JSON via `halt config show --format json`.
+fn show_example_config(config_path: &Path) -> serde_json::Value {
+    let dir = TempDir::new().unwrap();
+    let dot_halt = dir.path().join(".halt");
+    fs::create_dir_all(&dot_halt).unwrap();
+    fs::copy(config_path, dot_halt.join("halt.toml")).unwrap();
+    let out = run_halt(dir.path(), &["config", "show", "--format", "json"]);
+    let stdout = expect_success(&out);
+    serde_json::from_str(&stdout).expect("config show should produce valid JSON")
+}
+
+fn allowlist_contains(json: &serde_json::Value, domain: &str) -> bool {
+    json["proxy"]["domain_allowlist"]
+        .as_array()
+        .map(|a| a.iter().any(|v| v.as_str() == Some(domain)))
+        .unwrap_or(false)
+}
+
+#[test]
+fn test_example_claude_config_has_anthropic_domains() {
+    let json = show_example_config(&configs_dir().join("claude.toml"));
+    for domain in &["api.anthropic.com", "statsig.anthropic.com"] {
+        assert!(
+            allowlist_contains(&json, domain),
+            "Expected {domain} in claude.toml allowlist"
+        );
+    }
+}
+
+#[test]
+fn test_example_codex_config_has_openai_domains() {
+    let json = show_example_config(&configs_dir().join("codex.toml"));
+    for domain in &["api.openai.com", "*.openai.com"] {
+        assert!(
+            allowlist_contains(&json, domain),
+            "Expected {domain} in codex.toml allowlist"
+        );
+    }
+}
+
+#[test]
+fn test_example_gemini_config_has_google_domains() {
+    let json = show_example_config(&configs_dir().join("gemini.toml"));
+    for domain in &[
+        "generativelanguage.googleapis.com",
+        "oauth2.googleapis.com",
+        "accounts.google.com",
+    ] {
+        assert!(
+            allowlist_contains(&json, domain),
+            "Expected {domain} in gemini.toml allowlist"
+        );
+    }
+}
+
+#[test]
+fn test_example_configs_have_common_registries() {
+    // All three configs should grant access to the package registries that
+    // agents commonly need (npm, PyPI, crates.io, GitHub).
+    let required = [
+        "registry.npmjs.org",
+        "pypi.org",
+        "crates.io",
+        "github.com",
+    ];
+    let dir = configs_dir();
+    for config in &["claude.toml", "codex.toml", "gemini.toml"] {
+        let json = show_example_config(&dir.join(config));
+        for domain in &required {
+            assert!(
+                allowlist_contains(&json, domain),
+                "Expected {domain} in {config}"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// J. Example config — proxy startup and command execution (macOS sandbox)
+// ============================================================================
+
+/// Run a command inside the sandbox using an example config file.
+/// Passes `--no-config` so only the given file is loaded.
+fn run_with_example_config(config_path: &Path, cmd_args: &[&str]) -> Output {
+    let dir = TempDir::new().unwrap();
+    let mut args: Vec<String> = vec![
+        "run".into(),
+        "--no-config".into(),
+        "--config".into(),
+        config_path.to_str().unwrap().into(),
+    ];
+    args.extend(sys_exec_args());
+    args.push("--".into());
+    args.extend(cmd_args.iter().map(|s| s.to_string()));
+    Command::new(HALT)
+        .args(&args)
+        .current_dir(dir.path())
+        .env_remove("HALT_LOG")
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to spawn halt: {e}"))
+}
+
+#[test]
+fn test_example_claude_config_proxy_starts_cleanly() {
+    if !sandbox_available() {
+        return;
+    }
+    let out = run_with_example_config(
+        &configs_dir().join("claude.toml"),
+        &["/bin/echo", "claude-ok"],
+    );
+    assert!(expect_success(&out).contains("claude-ok"));
+}
+
+#[test]
+fn test_example_codex_config_proxy_starts_cleanly() {
+    if !sandbox_available() {
+        return;
+    }
+    let out = run_with_example_config(
+        &configs_dir().join("codex.toml"),
+        &["/bin/echo", "codex-ok"],
+    );
+    assert!(expect_success(&out).contains("codex-ok"));
+}
+
+#[test]
+fn test_example_gemini_config_proxy_starts_cleanly() {
+    if !sandbox_available() {
+        return;
+    }
+    let out = run_with_example_config(
+        &configs_dir().join("gemini.toml"),
+        &["/bin/echo", "gemini-ok"],
+    );
+    assert!(expect_success(&out).contains("gemini-ok"));
+}
+
+// ============================================================================
+// K. MCP server accessibility — localhost connectivity in proxy_only mode
+// ============================================================================
+
+#[test]
+fn test_proxy_mode_allows_localhost_mcp_connection() {
+    // MCP servers typically run on localhost (stdio or SSE). Verify that a
+    // sandboxed process in proxy_only mode can reach a TCP server on 127.0.0.1.
+    if !sandbox_available() {
+        return;
+    }
+
+    // Bind an ephemeral TCP port so there is something to connect to.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    let dir = TempDir::new().unwrap();
+    let mut extra = sys_exec_args();
+    // --allow triggers proxy_only mode, same as the example configs use.
+    extra.extend_from_slice(&["--allow".into(), "example.com".into()]);
+
+    // nc exits 0 on successful connect, 1 on refused — either is fine here.
+    // What must NOT appear is "Operation not permitted", which indicates the
+    // sandbox blocked the syscall rather than the server rejecting the conn.
+    let out = sandboxed_run(
+        dir.path(),
+        &extra,
+        &[
+            "/bin/sh",
+            "-c",
+            &format!("nc -zw1 127.0.0.1 {port} 2>&1; echo MCP_DONE"),
+        ],
+    );
+    let stdout = expect_success(&out);
+    assert!(stdout.contains("MCP_DONE"), "Shell did not complete: {stdout}");
+    assert!(
+        !stdout.contains("Operation not permitted"),
+        "Sandbox blocked localhost MCP connection: {stdout}"
+    );
+
+    drop(listener);
+}
 
 #[test]
 fn test_run_extra_config_merges_domain_allowlist() {
@@ -620,5 +815,119 @@ fn test_run_extra_config_merges_domain_allowlist() {
     assert!(
         allowlist.iter().any(|v| v.as_str() == Some("base-domain.example")),
         "Expected base-domain.example in allowlist, got: {allowlist:?}"
+    );
+}
+
+// ============================================================================
+// L. Run — --strict mode
+// ============================================================================
+
+/// Invoke `halt run --no-config --strict [extra_args] -- [cmd_args]`.
+fn strict_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Output {
+    let mut args: Vec<String> = vec!["run".into(), "--no-config".into(), "--strict".into()];
+    args.extend_from_slice(extra_args);
+    args.push("--".into());
+    for a in cmd_args {
+        args.push((*a).to_string());
+    }
+    Command::new(HALT)
+        .args(&args)
+        .current_dir(workspace)
+        .env_remove("HALT_LOG")
+        .output()
+        .unwrap_or_else(|e| panic!("Failed to spawn halt: {e}"))
+}
+
+#[test]
+fn test_strict_mode_exits_on_blocked_dns_query() {
+    // --strict with a proxy allowlist: a DNS query for a domain NOT in the
+    // allowlist should cause halt to kill the child and exit with code 2.
+    if !sandbox_available() {
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let mut extra = sys_exec_args();
+    // Allow only "allowed.internal" so that any real DNS query is blocked.
+    extra.extend_from_slice(&["--allow".into(), "allowed.internal".into()]);
+
+    // The child tries to resolve "blocked-domain.example" — this will be
+    // sent to our proxy DNS and rejected with NXDOMAIN.  In strict mode
+    // halt should detect the violation and terminate with exit code 2.
+    let out = strict_run(
+        dir.path(),
+        &extra,
+        &[
+            "/bin/sh",
+            "-c",
+            // Use the proxy DNS (set via SOCKS_DNS / system DNS pointing to
+            // the proxy resolver).  The easiest portable trigger: attempt a
+            // TCP DNS query to the proxy's DNS port via nc or /usr/bin/dig.
+            // We use `ping -c1 -W1 blocked-domain.example` — on macOS this
+            // triggers a DNS lookup through the default resolver, which in
+            // proxy mode is the halt proxy DNS.  The violation fires before
+            // the ping sends its first packet.
+            "ping -c1 -W1 blocked-domain.example 2>&1; echo PING_DONE",
+        ],
+    );
+
+    // halt --strict exits 2 on violation; the child is killed first.
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "Expected exit 2 (strict violation), got {:?}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("VIOLATION") || stderr.contains("violation") || stderr.contains("blocked"),
+        "Expected violation message in stderr, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_strict_mode_does_not_trigger_on_allowed_domain() {
+    // Sanity check: --strict with a matching domain in the allowlist must
+    // NOT kill the process.  The child should exit normally.
+    if !sandbox_available() {
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let mut extra = sys_exec_args();
+    // Allow "localhost" style so the child can bind/connect loopback.
+    extra.extend_from_slice(&["--allow".into(), "localhost".into()]);
+
+    let out = strict_run(
+        dir.path(),
+        &extra,
+        &["/bin/echo", "strict-ok"],
+    );
+    let stdout = expect_success(&out);
+    assert!(
+        stdout.contains("strict-ok"),
+        "Expected 'strict-ok' in stdout, got: {stdout}"
+    );
+}
+
+#[test]
+fn test_strict_mode_without_proxy_runs_normally() {
+    // --strict without a proxy (no --allow / not proxy mode): should not
+    // interfere with normal execution since there are no network violations
+    // to detect via the proxy channel.
+    if !sandbox_available() {
+        return;
+    }
+
+    let dir = TempDir::new().unwrap();
+    let extra = sys_exec_args();
+
+    let out = strict_run(dir.path(), &extra, &["/bin/echo", "no-proxy-strict-ok"]);
+    let stdout = expect_success(&out);
+    assert!(
+        stdout.contains("no-proxy-strict-ok"),
+        "Expected output, got: {stdout}"
     );
 }

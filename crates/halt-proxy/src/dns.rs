@@ -260,6 +260,10 @@ impl DnsServer {
         // Check domain against allowlist (case-insensitive)
         let domain_lower = domain.to_lowercase();
         if !self.state.is_allowed(&domain_lower) {
+            self.state.report_violation(format!(
+                "network: DNS query for \"{}\" blocked — domain not in allowlist",
+                domain_lower
+            ));
             return Ok(self.build_nxdomain_response(query));
         }
 

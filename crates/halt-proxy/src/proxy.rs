@@ -286,11 +286,14 @@ impl TcpProxy {
     /// * `Ok(domain)` - The domain this IP was resolved from
     /// * `Err(ProxyError::DomainBlocked)` - IP not in resolution cache
     fn verify_destination(&self, dest: &SocketAddr) -> Result<String> {
-        self.state
-            .lookup_resolved(&dest.ip())
-            .ok_or_else(|| ProxyError::DomainBlocked {
-                domain: format!("IP {} not in resolution cache", dest.ip()),
-            })
+        self.state.lookup_resolved(&dest.ip()).ok_or_else(|| {
+            let msg = format!(
+                "network: direct connection to {} blocked — IP not resolved through proxy DNS",
+                dest
+            );
+            self.state.report_violation(msg.clone());
+            ProxyError::DomainBlocked { domain: msg }
+        })
     }
 
     /// Connect to the destination with timeout.
@@ -430,12 +433,14 @@ impl TcpProxy {
                 }
                 let domain = std::str::from_utf8(&data[5..5 + domain_len])
                     .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
-                Err(ProxyError::DomainBlocked {
-                    domain: format!(
-                        "Domain {} not resolved through proxy DNS. Use IP address.",
+                {
+                    let msg = format!(
+                        "network: direct connection to domain \"{}\" blocked — must resolve through proxy DNS",
                         domain
-                    ),
-                })
+                    );
+                    self.state.report_violation(msg.clone());
+                    Err(ProxyError::DomainBlocked { domain: msg })
+                }
             }
             0x04 => {
                 // IPv6 address
