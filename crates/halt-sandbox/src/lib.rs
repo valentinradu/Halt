@@ -39,8 +39,6 @@ mod linux_netns;
 pub use config::SandboxConfig;
 pub use env::{build_env, resolve_path_directories};
 pub use halt_settings::{Mount, NetworkMode, SandboxPaths};
-#[cfg(target_os = "macos")]
-pub use macos::monitor_file_violations;
 
 use std::convert::Infallible;
 use std::process::Child;

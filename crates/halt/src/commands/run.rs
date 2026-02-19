@@ -5,8 +5,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use halt_proxy::{ProxyConfig, ProxyHandle, ProxyServer};
-#[cfg(target_os = "macos")]
-use halt_sandbox::monitor_file_violations;
 use halt_sandbox::{build_env, check_availability, spawn_sandboxed, NetworkMode, SandboxConfig};
 use halt_settings::{ConfigLoader, HaltConfig, SandboxPaths};
 
@@ -87,7 +85,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
         env_map.insert(k, v);
     }
 
-    // 4. Set up optional strict-mode violation channel (shared by proxy + filesystem monitor).
+    // 4. Set up optional strict-mode violation channel (unified: filesystem + network).
     let (strict_tx, strict_rx) = if args.strict {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
         (Some(tx), Some(rx))
@@ -98,7 +96,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // 5. Start proxy if needed.
     let (resolved_network, proxy_handle): (NetworkMode, Option<ProxyHandle>) = if wants_proxy {
         let mut proxy_config = build_proxy_config(&config.proxy)?;
-        proxy_config.violation_tx = strict_tx.clone();
+        proxy_config.violation_tx = strict_tx;
         let handle = ProxyServer::new(proxy_config)?.start().await?;
         let proxy_addr = handle.proxy_addr();
         (NetworkMode::ProxyOnly { proxy_addr }, Some(handle))
@@ -142,16 +140,11 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let mut child = spawn_sandboxed(&sandbox_cfg, cmd, &cmd_args)?;
     let child_pid = child.id();
 
-    // In strict mode, start filesystem violation monitor and wait for either
-    // the child to exit or a violation to be reported.
+    // In strict mode, wait for either the child to exit or a proxy/network
+    // violation to be reported.  Filesystem violations on macOS are returned as
+    // EPERM to the process by the kernel; detecting the specific denied path
+    // without root privileges is not reliably possible on macOS 14+.
     let exit_status = if let Some(mut violation_rx) = strict_rx {
-        // macOS: stream sandbox log for file-access violations into the same channel.
-        #[cfg(target_os = "macos")]
-        if let Some(fs_tx) = strict_tx {
-            monitor_file_violations(child_pid, fs_tx);
-        }
-
-        // Wait for child exit or violation, whichever comes first.
         let (done_tx, mut done_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let status = child.wait().unwrap_or_else(|_| {
@@ -230,23 +223,38 @@ fn print_violation(violation: &str) {
     } else if violation.starts_with("network:") {
         "verify the process uses DNS resolution and the target domain is in [proxy.domain_allowlist]".to_string()
     } else if violation.starts_with("filesystem:") {
-        // Extract path from: filesystem: "proc" was denied "op" access to "/path"
-        if let Some(path_start) = violation.rfind('"') {
-            if path_start + 1 < violation.len() {
-                let after = &violation[..path_start];
-                if let Some(path_open) = after.rfind('"') {
-                    let path = &violation[path_open + 1..path_start];
+        // Format: filesystem: "proc" was denied "operation" access to "path"
+        // Extract operation (second quoted token) and path (last quoted token).
+        let mut quotes = violation.match_indices('"').map(|(i, _)| i);
+        let op = quotes.next().and_then(|_| {
+            let o = quotes.next()?;
+            let c = quotes.next()?;
+            Some(&violation[o + 1..c])
+        });
+        // Path is the last quoted substring.
+        let path = violation.rfind('"').and_then(|end| {
+            let before = &violation[..end];
+            before.rfind('"').map(|start| &violation[start + 1..end])
+        });
+
+        match path {
+            Some(p) if !p.is_empty() => {
+                let is_dir = std::path::Path::new(p).is_dir();
+                let is_write = op.map_or(false, |o| o.contains("write"));
+                if is_write {
+                    format!("add \"{p}\" to [sandbox.paths.read_write] in your halt config")
+                } else if is_dir {
                     format!(
-                        "add \"{path}\" to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config"
+                        "add \"{p}\" to [sandbox.paths.traversal] (directory listing) \
+                         or [sandbox.paths.read] (file reads inside) in your halt config"
                     )
                 } else {
-                    "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
+                    format!(
+                        "add \"{p}\" to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config"
+                    )
                 }
-            } else {
-                "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
             }
-        } else {
-            "add the path to [sandbox.paths.read] or [sandbox.paths.read_write] in your halt config".to_string()
+            _ => "add the path to [sandbox.paths.traversal], [sandbox.paths.read], or [sandbox.paths.read_write] in your halt config".to_string(),
         }
     } else {
         "review your halt config".to_string()

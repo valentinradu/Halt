@@ -125,24 +125,6 @@ pub struct ResolvedAddress {
     pub expires_at: std::time::Instant,
 }
 
-/// Kind of sandbox network violation.
-#[derive(Debug, Clone)]
-pub enum ViolationKind {
-    /// A DNS query for a domain not in the allowlist was made.
-    DnsBlocked,
-    /// A TCP connection to an IP not resolved through proxy DNS was attempted.
-    TcpBlocked,
-}
-
-/// A sandbox network violation event, emitted when the proxy blocks an access.
-#[derive(Debug, Clone)]
-pub struct ViolationEvent {
-    /// The blocked domain name or IP address.
-    pub target: String,
-    /// Kind of violation.
-    pub kind: ViolationKind,
-}
-
 /// Default maximum number of IP entries in the resolution cache.
 const DEFAULT_MAX_CACHE_ENTRIES: usize = 4096;
 

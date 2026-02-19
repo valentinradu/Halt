@@ -176,79 +176,85 @@ impl TcpProxy {
 
     /// Handle a single client connection.
     ///
-    /// # Arguments
-    /// * `client` - The client connection
-    /// * `client_addr` - The client's address (for logging)
-    ///
-    /// # Behavior
-    /// 1. Read SOCKS5/HTTP CONNECT request
-    /// 2. Extract destination address
-    /// 3. Verify destination was resolved through DNS server
-    /// 4. Connect to destination
-    /// 5. Relay data bidirectionally
+    /// Supports both SOCKS5 and HTTP CONNECT so that the proxy works regardless
+    /// of which proxy scheme the sandboxed application uses
+    /// (`ALL_PROXY=socks5://…` or `HTTP_PROXY=http://…`).
     async fn handle_connection(
         &self,
         mut client: TcpStream,
         _client_addr: SocketAddr,
     ) -> Result<()> {
+        use tokio::io::AsyncReadExt;
+
+        // Peek at the first byte to determine the protocol.
+        let mut first = [0u8; 1];
+        client
+            .read_exact(&mut first)
+            .await
+            .map_err(|e| ProxyError::Internal(format!("Failed to peek protocol byte: {e}")))?;
+
+        if first[0] == 0x05 {
+            self.handle_socks5(client, first[0]).await
+        } else {
+            self.handle_http_connect(client, first[0]).await
+        }
+    }
+
+    /// Handle a SOCKS5 connection (first byte was already read).
+    async fn handle_socks5(
+        &self,
+        mut client: TcpStream,
+        first_byte: u8,
+    ) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // SOCKS5 greeting: client sends version and auth methods
-        let mut greeting = [0u8; 258];
+        // Read the rest of the SOCKS5 greeting (up to 257 more bytes after the first).
+        let mut rest = [0u8; 257];
         let n = client
-            .read(&mut greeting)
+            .read(&mut rest)
             .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 greeting: {}", e)))?;
+            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 greeting: {e}")))?;
 
-        if n < 2 || greeting[0] != 0x05 {
-            return Err(ProxyError::Internal("Invalid SOCKS5 greeting".to_string()));
-        }
+        // greeting[0] = first_byte (version = 0x05), rest[0..n] = nmethods + methods
+        let _ = first_byte; // already verified == 0x05 by caller
 
         // Send greeting response: no authentication required
         client.write_all(&[0x05, 0x00]).await.map_err(|e| {
-            ProxyError::Internal(format!("Failed to send greeting response: {}", e))
+            ProxyError::Internal(format!("Failed to send SOCKS5 greeting response: {e}"))
         })?;
 
-        // Read SOCKS5 request
+        let _ = (n, rest); // greeting parsed — methods ignored, we always use no-auth
+
+        // Read SOCKS5 CONNECT request
         let mut request = [0u8; 262];
         let n = client
             .read(&mut request)
             .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 request: {}", e)))?;
+            .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 request: {e}")))?;
 
         if n < 10 {
-            // Best-effort: if we can't notify the client, it will see a connection drop.
-            client
-                .write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE))
-                .await
-                .ok();
+            client.write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE)).await.ok();
             return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
         }
 
-        // Parse request to get destination
-        let dest = match self.parse_socks5_request(&request[..n]) {
+        // Resolve destination — for domain requests (ATYP=0x03) we check the
+        // allowlist and resolve internally instead of requiring prior DNS lookup.
+        let dest = match self.resolve_socks5_destination(&request[..n]).await {
             Ok(d) => d,
             Err(e) => {
-                // Best-effort: if we can't notify the client, it will see a connection drop.
-                client
-                    .write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE))
-                    .await
-                    .ok();
+                client.write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED)).await.ok();
                 return Err(e);
             }
         };
 
-        // Verify destination is in resolution cache (was resolved through our DNS)
-        if let Err(e) = self.verify_destination(&dest) {
-            // Best-effort: if we can't notify the client, it will see a connection drop.
-            client
-                .write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
-                .await
-                .ok();
-            return Err(e);
+        // For IP-based requests, verify the IP was resolved through our DNS.
+        if request[3] != 0x03 {
+            if let Err(e) = self.verify_destination(&dest) {
+                client.write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED)).await.ok();
+                return Err(e);
+            }
         }
 
-        // Connect to destination
         let destination = match self.connect_to_destination(dest).await {
             Ok(d) => d,
             Err(e) => {
@@ -256,25 +262,176 @@ impl TcpProxy {
                     ProxyError::TcpConnection { .. } => socks5::CONNECTION_REFUSED,
                     _ => socks5::GENERAL_FAILURE,
                 };
-                // Best-effort: if we can't notify the client, it will see a connection drop.
                 client.write_all(&self.build_socks5_error(code)).await.ok();
                 return Err(e);
             }
         };
 
-        // Get local address for response
         let local_addr = destination
             .local_addr()
             .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("hardcoded zero-address fallback"));
 
-        // Send success response
         client
             .write_all(&self.build_socks5_response(local_addr))
             .await
-            .map_err(|e| ProxyError::Internal(format!("Failed to send success response: {}", e)))?;
+            .map_err(|e| ProxyError::Internal(format!("Failed to send SOCKS5 success: {e}")))?;
 
-        // Relay data
         self.relay(client, destination).await
+    }
+
+    /// Handle an HTTP CONNECT connection (first byte was already read).
+    ///
+    /// Reads the full `CONNECT host:port HTTP/1.1\r\n…\r\n\r\n` request,
+    /// checks the target domain against the allowlist, then relays if allowed.
+    async fn handle_http_connect(
+        &self,
+        mut client: TcpStream,
+        first_byte: u8,
+    ) -> Result<()> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Read the rest of the HTTP CONNECT request line (up to 4 KiB).
+        let mut buf = vec![first_byte];
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = client
+                .read(&mut tmp)
+                .await
+                .map_err(|e| ProxyError::Internal(format!("HTTP CONNECT read error: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            // Stop once we see the end of the HTTP headers (\r\n\r\n).
+            if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+            if buf.len() > 8192 {
+                break;
+            }
+        }
+
+        // Parse the first line: "CONNECT host:port HTTP/1.x"
+        let header = std::str::from_utf8(&buf)
+            .map_err(|_| ProxyError::Internal("HTTP CONNECT: non-UTF8 request".to_string()))?;
+        let first_line = header.lines().next().unwrap_or("");
+
+        let (host, port) = self.parse_http_connect_target(first_line)?;
+        let domain_lower = host.to_lowercase();
+
+        // Check allowlist.
+        if !self.state.is_allowed(&domain_lower) {
+            self.state.report_violation(format!(
+                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
+            ));
+            let _ = client
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await;
+            return Err(ProxyError::DomainBlocked { domain: domain_lower });
+        }
+
+        // Resolve the host.
+        let addr_str = format!("{host}:{port}");
+        let dest = tokio::net::lookup_host(&addr_str)
+            .await
+            .map_err(|e| ProxyError::DnsResolution {
+                domain: host.to_string(),
+                message: e.to_string(),
+            })?
+            .next()
+            .ok_or_else(|| ProxyError::DnsResolution {
+                domain: host.to_string(),
+                message: "no addresses returned".to_string(),
+            })?;
+
+        let destination = self.connect_to_destination(dest).await.map_err(|e| {
+            let _ = tokio::runtime::Handle::try_current().map(|_| {
+                // best-effort; we're in async context
+            });
+            e
+        })?;
+
+        // Send 200 Connection Established.
+        client
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .map_err(|e| ProxyError::Internal(format!("HTTP CONNECT: write 200 failed: {e}")))?;
+
+        self.relay(client, destination).await
+    }
+
+    /// Parse "CONNECT host:port HTTP/1.x" into `(host, port)`.
+    fn parse_http_connect_target<'a>(&self, line: &'a str) -> Result<(&'a str, u16)> {
+        // Format: CONNECT <host>:<port> HTTP/1.x
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let target = parts.next().unwrap_or("");
+
+        if !method.eq_ignore_ascii_case("CONNECT") {
+            return Err(ProxyError::Internal(format!(
+                "Expected CONNECT, got {method:?}"
+            )));
+        }
+
+        let (host, port_str) = target.rsplit_once(':').ok_or_else(|| {
+            ProxyError::Internal(format!("HTTP CONNECT target missing port: {target:?}"))
+        })?;
+
+        let port = port_str.parse::<u16>().map_err(|_| {
+            ProxyError::Internal(format!("HTTP CONNECT invalid port: {port_str:?}"))
+        })?;
+
+        Ok((host, port))
+    }
+
+    /// Resolve a SOCKS5 destination.
+    ///
+    /// For ATYP=0x03 (domain name), checks the allowlist and resolves via
+    /// the system resolver.  For ATYP=0x01/0x04 (IP), delegates to
+    /// `parse_socks5_request` (IP must be in the resolution cache).
+    async fn resolve_socks5_destination(&self, data: &[u8]) -> Result<SocketAddr> {
+        if data.len() < 5 {
+            return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
+        }
+
+        if data[3] != 0x03 {
+            // IP-based: parse normally; caller will verify against resolution cache.
+            return self.parse_socks5_request(data);
+        }
+
+        // Domain-based (ATYP=0x03).
+        let domain_len = data[4] as usize;
+        if data.len() < 5 + domain_len + 2 {
+            return Err(ProxyError::Internal("SOCKS5 domain request too short".to_string()));
+        }
+        let domain = std::str::from_utf8(&data[5..5 + domain_len])
+            .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
+        let port = u16::from_be_bytes([
+            data[5 + domain_len],
+            data[5 + domain_len + 1],
+        ]);
+        let domain_lower = domain.to_lowercase();
+
+        if !self.state.is_allowed(&domain_lower) {
+            self.state.report_violation(format!(
+                "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
+            ));
+            return Err(ProxyError::DomainBlocked { domain: domain_lower });
+        }
+
+        // Resolve via system resolver (domain is allowed).
+        let addr_str = format!("{domain}:{port}");
+        let domain_owned = domain.to_string();
+        let mut addrs = tokio::net::lookup_host(addr_str)
+            .await
+            .map_err(|e| ProxyError::DnsResolution {
+                domain: domain_owned.clone(),
+                message: e.to_string(),
+            })?;
+        addrs.next().ok_or_else(|| ProxyError::DnsResolution {
+            domain: domain_owned,
+            message: "no addresses returned".to_string(),
+        })
     }
 
     /// Verify that the destination is allowed (was resolved through DNS).

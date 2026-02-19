@@ -104,10 +104,14 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // =========================================================================
     // TRAVERSAL PATHS - allow reading the directory entry itself
     // =========================================================================
-    for path in &traversal {
-        validate_path_for_sbpl(path)?;
-        let escaped = escape_sbpl_path(path);
-        profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", escaped));
+    for (path, is_glob) in &traversal {
+        if *is_glob {
+            add_sbpl_glob_rule(&mut profile, path, "file-read-data");
+        } else {
+            validate_path_for_sbpl(path)?;
+            let escaped = escape_sbpl_path(path);
+            profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", escaped));
+        }
     }
 
     // Add workspace parent directories for realpath traversal
@@ -121,17 +125,25 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     // =========================================================================
     // READ PATHS - subpath content access
     // =========================================================================
-    for path in &read {
-        validate_path_for_sbpl(path)?;
-        add_sbpl_path_rule(&mut profile, path, "file-read-data");
+    for (path, is_glob) in &read {
+        if *is_glob {
+            add_sbpl_glob_rule(&mut profile, path, "file-read-data");
+        } else {
+            validate_path_for_sbpl(path)?;
+            add_sbpl_path_rule(&mut profile, path, "file-read-data");
+        }
     }
 
     // =========================================================================
     // READ-WRITE PATHS - subpath content and write access
     // =========================================================================
-    for path in &read_write {
-        validate_path_for_sbpl(path)?;
-        add_sbpl_path_rule(&mut profile, path, "file-read-data file-write*");
+    for (path, is_glob) in &read_write {
+        if *is_glob {
+            add_sbpl_glob_rule(&mut profile, path, "file-read-data file-write*");
+        } else {
+            validate_path_for_sbpl(path)?;
+            add_sbpl_path_rule(&mut profile, path, "file-read-data file-write*");
+        }
     }
 
     // Workspace - always read/write (validated as user-supplied input)
@@ -209,6 +221,32 @@ fn canonicalize_for_sbpl(path: &Path) -> String {
         .unwrap_or_else(|_| escape_sbpl_path(path))
 }
 
+/// Add SBPL rules for a glob path (prefix match) using SBPL regex.
+///
+/// A glob path `~/.claude.json*` (with trailing `*` stripped before calling here)
+/// generates a regex rule that matches the path and anything starting with it.
+/// The regex is anchored at the start (`^`) and the path chars are regex-escaped.
+fn add_sbpl_glob_rule(profile: &mut String, path: &Path, access: &str) {
+    let s = path.to_string_lossy();
+    // Regex-escape the path (only `.` is special in practice for file paths).
+    let escaped_regex = s.replace('.', "\\.");
+    let canonical = path
+        .canonicalize()
+        .map(|p| p.to_string_lossy().replace('.', "\\."))
+        .unwrap_or_else(|_| escaped_regex.clone());
+
+    profile.push_str(&format!(
+        "(allow {} (regex \"^{}\"))\n",
+        access, canonical
+    ));
+    if escaped_regex != canonical {
+        profile.push_str(&format!(
+            "(allow {} (regex \"^{}\"))\n",
+            access, escaped_regex
+        ));
+    }
+}
+
 /// Add SBPL rules for a path, including both original and canonical if they differ.
 ///
 /// macOS has symlinks like /var -> /private/var. File operations may use either path,
@@ -250,104 +288,6 @@ fn add_sbpl_path_rule(profile: &mut String, path: &Path, access: &str) {
     }
 }
 
-/// Spawn a background thread that streams kernel sandbox messages from the macOS
-/// unified log and forwards any file-access denials for `child_pid` to `tx`.
-///
-/// Called by `halt run --strict` after spawning the child process.  The thread
-/// exits when `tx` is closed (i.e. a violation has already been reported and
-/// the caller has killed the child) or when the log stream subprocess ends.
-///
-/// Log format (compact style, from kernel with Sandbox subsystem):
-/// ```text
-/// 2024-01-01 12:00:00.000 E  kernel[0:abc] (Sandbox) Sandbox: cat(1234) deny(1) file-read-data /some/path
-/// ```
-#[cfg(target_os = "macos")]
-pub fn monitor_file_violations(
-    child_pid: u32,
-    tx: tokio::sync::mpsc::UnboundedSender<String>,
-) {
-    std::thread::spawn(move || {
-        use std::io::{BufRead, BufReader};
-        use std::process::{Command, Stdio};
-
-        // Violations are logged by the kernel under the Sandbox subsystem.
-        // The predicate matches kernel messages containing sandbox denials.
-        let mut log_proc = match Command::new("/usr/bin/log")
-            .args([
-                "stream",
-                "--style",
-                "compact",
-                "--predicate",
-                r#"process == "kernel" AND message CONTAINS "deny(" AND message CONTAINS "Sandbox:""#,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(p) => p,
-            Err(_) => return,
-        };
-
-        let stdout = match log_proc.stdout.take() {
-            Some(s) => s,
-            None => return,
-        };
-
-        // Filter by child PID: kernel logs "Sandbox: processname(PID) deny(..."
-        let pid_tag = format!("({child_pid})");
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else { break };
-            if tx.is_closed() {
-                break;
-            }
-            if !line.contains(&pid_tag) {
-                continue;
-            }
-            if let Some(msg) = parse_sandbox_log_line(&line) {
-                let _ = tx.send(msg);
-                break;
-            }
-        }
-
-        let _ = log_proc.kill();
-    });
-}
-
-/// Parse a compact-style unified-log line from the kernel Sandbox subsystem
-/// into a human-readable violation message.
-///
-/// Expected format (from `log stream --style compact`):
-/// ```text
-/// 2024-01-01 ... kernel[0:abc] (Sandbox) Sandbox: cat(1234) deny(1) file-read-data /some/path
-/// ```
-#[cfg(target_os = "macos")]
-fn parse_sandbox_log_line(line: &str) -> Option<String> {
-    // Find "Sandbox:" anchor (kernel Sandbox subsystem prefix).
-    let start = line.find("Sandbox:")?;
-    let rest = line[start + 8..].trim();
-
-    // Extract process name and PID: "processname(PID) deny(..."
-    let open = rest.find('(')?;
-    let close = rest[open..].find(')')? + open;
-    let process = &rest[..open];
-
-    // Find "deny(" after the PID.
-    let after_pid = &rest[close + 1..];
-    let deny_start = after_pid.find("deny(")?;
-    let deny_body = &after_pid[deny_start + 5..];
-    let deny_end = deny_body.find(')')?;
-    let after_deny = deny_body[deny_end + 1..].trim();
-
-    // Split into operation and target path.
-    let (operation, target) = match after_deny.find(' ') {
-        Some(pos) => (&after_deny[..pos], after_deny[pos + 1..].trim()),
-        None => (after_deny, ""),
-    };
-
-    Some(format!(
-        "filesystem: {process:?} was denied {operation:?} access to {target:?}",
-    ))
-}
 
 /// Check if a file is executable
 fn is_executable(path: &Path) -> bool {
