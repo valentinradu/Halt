@@ -12,6 +12,24 @@
 [sandbox]
 network = { mode = "proxy_only" }
 
+[sandbox.paths]
+# Allow listing the home directory so Node.js can discover config paths
+traversal = ["~"]
+
+read = [
+  # macOS per-user system files read by most Node.js processes
+  "~/.CFUserTextEncoding",
+  "~/Library/Preferences",
+  "~/Library/Application Support/com.apple.TCC",
+  # Git config (Codex reads these when running git commands)
+  "~/.gitconfig",
+  "~/.config/git",
+]
+read_write = [
+  # Codex writes config, auth tokens, session history, and logs here
+  "~/.codex",
+]
+
 [proxy]
 domain_allowlist = [
   # OpenAI API

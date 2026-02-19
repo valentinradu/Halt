@@ -13,6 +13,24 @@
 [sandbox]
 network = { mode = "proxy_only" }
 
+[sandbox.paths]
+# Allow listing the home directory so Node.js can discover config paths
+traversal = ["~"]
+
+read = [
+  # macOS per-user system files read by most Node.js processes
+  "~/.CFUserTextEncoding",
+  "~/Library/Preferences",
+  "~/Library/Application Support/com.apple.TCC",
+  # Git config (Gemini reads these when running git commands)
+  "~/.gitconfig",
+  "~/.config/git",
+]
+read_write = [
+  # Gemini CLI writes config, OAuth tokens, session state, and logs here
+  "~/.gemini",
+]
+
 [proxy]
 domain_allowlist = [
   # Google AI / Gemini APIs

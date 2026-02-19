@@ -9,9 +9,40 @@
 #
 # Tighter usage (ignore global/project halt.toml, use only this file):
 #   halt run --no-config --config configs/claude.toml -- claude
+#
+# NOTE: macOS Keychain access does not work under sandbox-exec (the SBPL
+# sandbox). Claude Code stores its OAuth tokens in the Keychain, so you must
+# pass your API key via environment variable instead:
+#
+#   ANTHROPIC_API_KEY=sk-ant-... halt run --config configs/claude.toml -- claude
+#
+# or:
+#   halt run --config configs/claude.toml --env ANTHROPIC_API_KEY -- claude
 
 [sandbox]
 network = { mode = "proxy_only" }
+
+[sandbox.paths]
+# Allow listing the home directory so Node.js can discover config paths
+traversal = ["~"]
+
+read = [
+  # Claude Code installation and runtime data
+  "~/.local/share/claude",
+  # macOS per-user system files read by most Node.js processes
+  "~/.CFUserTextEncoding",
+  "~/Library/Preferences",
+  "~/Library/Application Support/com.apple.TCC",
+  # Git config (Claude reads these when running git commands)
+  "~/.gitconfig",
+  "~/.config/git",
+]
+read_write = [
+  # Claude Code writes session data, debug logs, todos, and project history here
+  "~/.claude",
+  # Glob: covers .claude.json, .claude.json.lock, .claude.json.tmp.PID.TS, etc.
+  "~/.claude.json*",
+]
 
 [proxy]
 domain_allowlist = [

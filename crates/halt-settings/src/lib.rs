@@ -83,8 +83,39 @@ impl SandboxPaths {
     /// Expand each list into `PathBuf` values.
     ///
     /// Returns `(traversal, read, read_write)`.
-    pub fn expand_paths(&self) -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>) {
-        let to_paths = |v: &Vec<String>| v.iter().map(PathBuf::from).collect::<Vec<_>>();
+    /// Expand paths, resolving `~/` to the user's home directory.
+    ///
+    /// Returns `(traversal, read, read_write)` where each list contains
+    /// `(path, is_glob)` pairs.  A path is a glob when the config entry ends
+    /// with `*`; the `*` is stripped from the returned `PathBuf` and callers
+    /// should treat the path as a prefix (matching the path and everything
+    /// under / starting with it).
+    pub fn expand_paths(&self) -> (Vec<(PathBuf, bool)>, Vec<(PathBuf, bool)>, Vec<(PathBuf, bool)>) {
+        let home = dirs::home_dir();
+        let expand = |s: &str| -> (PathBuf, bool) {
+            let (s, is_glob) = if s.ends_with('*') {
+                (&s[..s.len() - 1], true)
+            } else {
+                (s, false)
+            };
+            let path = if let Some(rest) = s.strip_prefix("~/") {
+                if let Some(ref h) = home {
+                    h.join(rest)
+                } else {
+                    PathBuf::from(s)
+                }
+            } else if s == "~" {
+                if let Some(ref h) = home {
+                    h.clone()
+                } else {
+                    PathBuf::from(s)
+                }
+            } else {
+                PathBuf::from(s)
+            };
+            (path, is_glob)
+        };
+        let to_paths = |v: &Vec<String>| v.iter().map(|s| expand(s)).collect::<Vec<_>>();
         (
             to_paths(&self.traversal),
             to_paths(&self.read),
@@ -97,11 +128,28 @@ impl SandboxPaths {
         Self {
             traversal: vec!["/".to_string()],
             read: vec![
+                "/bin".to_string(),
+                "/sbin".to_string(),
+                "/usr/bin".to_string(),
+                "/usr/sbin".to_string(),
                 "/usr/lib".to_string(),
                 "/usr/share".to_string(),
                 "/etc".to_string(),
+                // macOS system paths needed by most processes
+                "/Library/Preferences/Logging".to_string(),
+                "/Library/Preferences/SystemConfiguration".to_string(),
+                "/System/Library".to_string(),
+                "/System/Volumes/Preboot/Cryptexes".to_string(),
+                "/private/var/db/timezone".to_string(),
+                "/private/var/db/dyld".to_string(),
             ],
-            read_write: vec!["/tmp".to_string()],
+            read_write: vec![
+                "/tmp".to_string(),
+                // Device files — processes need to open /dev/null, /dev/urandom, etc.
+                "/dev".to_string(),
+                // macOS per-user volatile cache dirs (used by Keychain/MDS/Security framework)
+                "/private/var/folders".to_string(),
+            ],
         }
     }
 }
@@ -367,9 +415,9 @@ mod tests {
             read_write: vec!["/tmp".to_string()],
         };
         let (traversal, read, read_write) = paths.expand_paths();
-        assert_eq!(traversal, vec![PathBuf::from("/")]);
-        assert_eq!(read, vec![PathBuf::from("/usr/lib")]);
-        assert_eq!(read_write, vec![PathBuf::from("/tmp")]);
+        assert_eq!(traversal, vec![(PathBuf::from("/"), false)]);
+        assert_eq!(read, vec![(PathBuf::from("/usr/lib"), false)]);
+        assert_eq!(read_write, vec![(PathBuf::from("/tmp"), false)]);
     }
 
     #[test]

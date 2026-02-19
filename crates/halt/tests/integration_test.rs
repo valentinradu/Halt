@@ -839,44 +839,60 @@ fn strict_run(workspace: &Path, extra_args: &[String], cmd_args: &[&str]) -> Out
 }
 
 #[test]
-fn test_strict_mode_exits_on_blocked_dns_query() {
-    // --strict with a proxy allowlist: a DNS query for a domain NOT in the
-    // allowlist should cause halt to kill the child and exit with code 2.
+fn test_strict_mode_exits_on_socks5_domain_violation() {
+    // --strict with proxy mode: sending a SOCKS5 domain request to the halt
+    // proxy for a domain NOT in the allowlist triggers a violation, causing
+    // halt to kill the child and exit with code 2.
+    //
+    // Mechanism: the sandbox injects HTTP_PROXY=http://127.0.0.1:PORT into the
+    // child environment.  We extract that port and use Python's socket module
+    // to send a raw SOCKS5 CONNECT request with a domain name (ATYP=0x03).
+    // The proxy reports the violation immediately.
     if !sandbox_available() {
         return;
     }
 
     let dir = TempDir::new().unwrap();
     let mut extra = sys_exec_args();
-    // Allow only "allowed.internal" so that any real DNS query is blocked.
+    // --allow sets up the proxy; "allowed.internal" is the only permitted domain.
     extra.extend_from_slice(&["--allow".into(), "allowed.internal".into()]);
 
-    // The child tries to resolve "blocked-domain.example" — this will be
-    // sent to our proxy DNS and rejected with NXDOMAIN.  In strict mode
-    // halt should detect the violation and terminate with exit code 2.
+    // Bash script: extract proxy port from $HTTP_PROXY, open a raw SOCKS5
+    // connection using bash's /dev/tcp, send a CONNECT for a blocked domain,
+    // then sleep so halt has time to receive the violation before we exit.
+    //
+    // blocked-domain.example is 22 chars (0x16).
+    // We pause between the greeting and the CONNECT so the server processes
+    // each phase separately (avoids the server reading both in one recv).
+    let script = concat!(
+        "PROXY_PORT=$(echo \"${HTTP_PROXY:-}\" | grep -oE '[0-9]+$'); ",
+        "[ -z \"$PROXY_PORT\" ] && exit 0; ",
+        "exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}; ",
+        // SOCKS5 greeting: v5, 1 method, no-auth
+        "printf '\\x05\\x01\\x00' >&3; ",
+        // Brief pause so server reads greeting, sends 2-byte reply, awaits CONNECT
+        "sleep 0.1; ",
+        // SOCKS5 CONNECT: v5, CONNECT, RSV, ATYP=domain(0x03), len=22,
+        // "blocked-domain.example", port=80 (0x00 0x50)
+        "printf '\\x05\\x01\\x00\\x03\\x16blocked-domain.example\\x00\\x50' >&3; ",
+        "exec 3>&-; ",
+        // Sleep so halt detects violation before we exit
+        "sleep 0.3"
+    );
+
     let out = strict_run(
         dir.path(),
         &extra,
-        &[
-            "/bin/sh",
-            "-c",
-            // Use the proxy DNS (set via SOCKS_DNS / system DNS pointing to
-            // the proxy resolver).  The easiest portable trigger: attempt a
-            // TCP DNS query to the proxy's DNS port via nc or /usr/bin/dig.
-            // We use `ping -c1 -W1 blocked-domain.example` — on macOS this
-            // triggers a DNS lookup through the default resolver, which in
-            // proxy mode is the halt proxy DNS.  The violation fires before
-            // the ping sends its first packet.
-            "ping -c1 -W1 blocked-domain.example 2>&1; echo PING_DONE",
-        ],
+        &["/bin/bash", "-c", script],
     );
 
     // halt --strict exits 2 on violation; the child is killed first.
     assert_eq!(
         out.status.code(),
         Some(2),
-        "Expected exit 2 (strict violation), got {:?}\nstderr: {}",
+        "Expected exit 2 (strict violation), got {:?}\nstdout: {}\nstderr: {}",
         out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),
     );
 
