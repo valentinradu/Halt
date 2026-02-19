@@ -78,7 +78,19 @@ brew install halt
 ### AUR (Arch Linux)
 
 ```bash
-yay -S halt-sandbox
+yay -S halt
+```
+
+### Debian / Ubuntu
+
+```bash
+curl -fsSL https://valentinradu.github.io/Halt/apt/KEY.gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/halt.gpg
+echo "deb [signed-by=/etc/apt/keyrings/halt.gpg arch=$(dpkg --print-architecture)] \
+  https://valentinradu.github.io/Halt/apt ./" \
+  | sudo tee /etc/apt/sources.list.d/halt.list
+sudo apt update
+sudo apt install halt
 ```
 
 ---

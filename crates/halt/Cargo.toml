@@ -27,3 +27,19 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = { workspace = true }
 toml = "0.8"
+
+[package.metadata.deb]
+name = "halt"
+maintainer = "Valentin Radu"
+copyright = "2024, Valentin Radu"
+license-file = ["../../LICENSE", "4"]
+extended-description = """\
+Wrap any process in a filesystem and network sandbox using native OS \
+mechanisms (Linux Landlock + network namespaces) with a built-in \
+DNS/TCP proxy for domain allowlisting."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/halt", "usr/bin/", "755"],
+]
