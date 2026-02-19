@@ -384,10 +384,6 @@ pub fn spawn_with_sandbox(
     command.stdout(Stdio::inherit());
     command.stderr(Stdio::inherit());
 
-    if std::env::var("HALT_DEBUG_SBPL").is_ok() {
-        eprintln!("=== SBPL PROFILE ===\n{profile}\n=== END SBPL PROFILE ===");
-    }
-
     command.spawn().map_err(SandboxError::SpawnFailed)
 }
 
