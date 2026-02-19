@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-agent-configs.sh — smoke-tests halt with each Linux agent config.
+# test-linux-agents.sh — e2e smoke-tests halt with each Linux agent config.
 #
 # Tests two sandbox dimensions for every agent:
 #   1. Filesystem (Landlock): workspace is writable; paths outside it are blocked.
@@ -11,7 +11,7 @@
 #   - NET_ADMIN capability (for halt's network namespace creation)
 #
 # Usage inside the halt-test container:
-#   /halt/docker/test-agent-configs.sh
+#   /halt/e2e/test-linux-agents.sh
 #
 # Exit codes: 0 = all tests passed, 1 = at least one test failed.
 

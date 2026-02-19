@@ -4,13 +4,13 @@
 # and provides all tools needed for the agent-config test suite.
 #
 # Build:
-#   docker build -t halt-test -f docker/Dockerfile .
+#   docker build -t halt-test -f e2e/Dockerfile .
 #
 # Run unit + integration tests:
 #   docker run --rm --cap-add NET_ADMIN halt-test cargo test --workspace
 #
 # Run agent-config smoke tests:
-#   docker run --rm --cap-add NET_ADMIN halt-test /halt/docker/test-agent-configs.sh
+#   docker run --rm --cap-add NET_ADMIN halt-test /halt/e2e/test-linux-agents.sh
 #
 # NET_ADMIN is required for halt's Linux network-namespace isolation
 # (ProxyOnly / LocalhostOnly modes call unshare(CLONE_NEWNET) + ip-link).
@@ -46,10 +46,10 @@ COPY --from=builder /halt/target/release/halt /usr/local/bin/halt
 
 # Copy configs and test script so they are available inside the container.
 COPY configs/ /halt/configs/
-COPY docker/test-agent-configs.sh /halt/docker/test-agent-configs.sh
-RUN chmod +x /halt/docker/test-agent-configs.sh
+COPY e2e/test-linux-agents.sh /halt/e2e/test-linux-agents.sh
+RUN chmod +x /halt/e2e/test-linux-agents.sh
 
 WORKDIR /workspace
 
 # Default: run the agent-config smoke tests.
-CMD ["/halt/docker/test-agent-configs.sh"]
+CMD ["/halt/e2e/test-linux-agents.sh"]
