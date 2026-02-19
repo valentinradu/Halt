@@ -41,23 +41,18 @@ pub enum SettingsError {
 }
 
 /// Network isolation mode for sandboxed processes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum NetworkMode {
     /// Unrestricted network access.
     Unrestricted,
     /// Only loopback (127.0.0.1 / ::1) is reachable.
+    #[default]
     LocalhostOnly,
     /// Route all traffic through a local proxy at the given address.
     ProxyOnly { proxy_addr: std::net::SocketAddr },
     /// No network access at all.
     Blocked,
-}
-
-impl Default for NetworkMode {
-    fn default() -> Self {
-        NetworkMode::LocalhostOnly
-    }
 }
 
 /// Filesystem paths made available to the sandboxed process.
