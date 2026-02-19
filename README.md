@@ -71,7 +71,7 @@ cargo install --path crates/halt
 ### Homebrew (macOS / Linux)
 
 ```bash
-brew tap valentinradu/halt https://github.com/valentinradu/Halt
+brew tap valentinradu/halt
 brew install halt
 ```
 

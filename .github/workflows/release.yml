@@ -100,19 +100,13 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-  # ── Update Homebrew formula in this repo ─────────────────────────────────
+  # ── Update Homebrew tap repo ──────────────────────────────────────────────
   homebrew:
-    name: Update Homebrew formula
+    name: Update Homebrew tap
     needs: release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
-
       - name: Download macOS artifacts
         uses: actions/download-artifact@v4
         with:
@@ -127,20 +121,21 @@ jobs:
           echo "x86_sha=$X86" >> "$GITHUB_OUTPUT"
           echo "arm_sha=$ARM" >> "$GITHUB_OUTPUT"
 
-      - name: Update Formula/halt.rb
+      - name: Checkout tap repo
+        uses: actions/checkout@v4
+        with:
+          repository: valentinradu/homebrew-halt
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
         env:
           TAG: ${{ github.ref_name }}
           X86_SHA: ${{ steps.shas.outputs.x86_sha }}
           ARM_SHA: ${{ steps.shas.outputs.arm_sha }}
         run: |
           VERSION="${TAG#v}"
-          cat > Formula/halt.rb <<EOF
-          # Homebrew formula for halt.
-          #
-          # To install:
-          #   brew tap valentinradu/halt https://github.com/valentinradu/Halt
-          #   brew install halt
-
+          cat > tap/Formula/halt.rb <<EOF
           class Halt < Formula
             desc "Wrap any process in a filesystem and network sandbox"
             homepage "https://github.com/valentinradu/Halt"
@@ -167,10 +162,11 @@ jobs:
           end
           EOF
 
-      - name: Commit and push formula
+      - name: Commit and push
         run: |
+          cd tap
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/halt.rb
-          git commit -m "chore: update Homebrew formula for ${{ github.ref_name }}"
+          git commit -m "halt ${{ github.ref_name }}"
           git push
