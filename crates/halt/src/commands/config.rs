@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use halt_settings::{ConfigLoader, HaltConfig};
 
@@ -16,7 +16,7 @@ pub async fn config(
     }
 }
 
-async fn init(global: bool, cwd: &PathBuf) -> Result<(), CliError> {
+async fn init(global: bool, cwd: &Path) -> Result<(), CliError> {
     let path = if global {
         ConfigLoader::global_config_path().ok_or_else(|| {
             CliError::Other(
@@ -43,7 +43,7 @@ async fn init(global: bool, cwd: &PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn show(format: OutputFormat, cwd: &PathBuf) -> Result<(), CliError> {
+async fn show(format: OutputFormat, cwd: &Path) -> Result<(), CliError> {
     let config = ConfigLoader::load(cwd)?;
     match format {
         OutputFormat::Toml => {
@@ -59,7 +59,7 @@ async fn show(format: OutputFormat, cwd: &PathBuf) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn edit(global: bool, cwd: &PathBuf) -> Result<(), CliError> {
+async fn edit(global: bool, cwd: &Path) -> Result<(), CliError> {
     let path = if global {
         ConfigLoader::global_config_path().ok_or_else(|| {
             CliError::Other(

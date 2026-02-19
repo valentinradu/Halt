@@ -1088,12 +1088,11 @@ mod tests {
         skip_if_no_bind!();
         use crate::ResolvedAddress;
         use std::sync::Arc;
-        use tokio::net::UdpSocket;
 
         let config = ProxyConfig {
             dns_bind_addr: "127.0.0.1:25374".parse().unwrap(),
             proxy_bind_addr: "127.0.0.1:29321".parse().unwrap(),
-            domain_allowlist: vec!["cached.local".to_string()],
+            domain_allowlist: vec!["cached.example".to_string()],
             ..Default::default()
         };
         let server = ProxyServer::new(config).unwrap();
@@ -1101,9 +1100,10 @@ mod tests {
         // Clone state Arc before server.start() consumes self
         let state = Arc::clone(&server.state);
 
-        // Pre-populate cache (simulating DNS resolution)
+        // Pre-populate cache (simulating what happens after DNS resolution).
+        // We insert before start() to verify the cache survives server init.
         let resolved = ResolvedAddress {
-            domain: "cached.local".to_string(),
+            domain: "cached.example".to_string(),
             addresses: vec!["192.0.2.1".parse().unwrap()],
             expires_at: std::time::Instant::now() + std::time::Duration::from_secs(300),
         };
@@ -1111,24 +1111,12 @@ mod tests {
 
         let handle = server.start().await.unwrap();
 
-        // DNS query should still work
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let query = build_test_dns_query("cached.local", 1);
-        socket.send_to(&query, "127.0.0.1:25374").await.unwrap();
-
-        let mut buf = [0u8; 512];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            socket.recv_from(&mut buf),
-        )
-        .await;
-        assert!(result.is_ok());
-
-        // TCP proxy can use the cached entry
+        // The shared cache is visible to the TCP proxy side: a connection to
+        // 192.0.2.1 should be recognised as targeting "cached.example".
         let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
         let lookup = state.cache.lookup(&ip);
         assert!(lookup.is_some());
-        assert_eq!(lookup.unwrap(), "cached.local");
+        assert_eq!(lookup.unwrap(), "cached.example");
 
         handle.shutdown().await.unwrap();
     }

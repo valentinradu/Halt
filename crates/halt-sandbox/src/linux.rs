@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 
 /// Minimum required Landlock ABI version.
 /// ABI v4 requires kernel 5.19+.
+#[allow(dead_code)]
 pub const MIN_LANDLOCK_ABI: i32 = 4;
 
 /// System paths to allow read access (libraries, config, etc.)
@@ -61,17 +62,18 @@ const DEVICE_PATHS: &[&str] = &["/dev", "/proc"];
 /// Returns `SandboxUnavailable` with kernel upgrade suggestion if not available.
 #[cfg(target_os = "linux")]
 pub fn check_available() -> Result<(), SandboxError> {
-    use landlock::ABI;
+    use landlock::{ABI, Access, AccessFs, Ruleset, RulesetAttr};
 
-    // Check if ABI v4 is supported
-    if ABI::V4.is_compatible() {
-        Ok(())
-    } else {
-        Err(SandboxError::SandboxUnavailable {
+    // Try to create a minimal ruleset — succeeds only if the kernel supports ABI v4.
+    let all_access = AccessFs::from_all(ABI::V4);
+    Ruleset::default()
+        .handle_access(all_access)
+        .and_then(|r| r.create())
+        .map(|_| ())
+        .map_err(|_| SandboxError::SandboxUnavailable {
             reason: "Landlock ABI v4 not available".to_string(),
             remediation: "Upgrade to Linux kernel 5.19+ for Landlock ABI v4 support".to_string(),
         })
-    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -128,7 +130,7 @@ pub fn build_landlock_ruleset(
     // Helper to add path rule, skipping non-existent paths
     let add_path = |ruleset: &mut landlock::RulesetCreated,
                     path: &Path,
-                    access: AccessFs|
+                    access|
      -> Result<(), SandboxError> {
         if !path.exists() {
             return Ok(()); // Skip non-existent paths
@@ -203,8 +205,6 @@ pub fn build_landlock_ruleset(
 /// * `SandboxUnavailable` - If restrict_self fails
 #[cfg(target_os = "linux")]
 pub fn apply_landlock(ruleset: landlock::RulesetCreated) -> Result<(), SandboxError> {
-    use landlock::RulesetCreatedAttr;
-
     ruleset
         .restrict_self()
         .map_err(|e| SandboxError::SandboxUnavailable {
@@ -479,60 +479,63 @@ pub fn spawn_with_landlock(
 
             let mut ruleset = Ruleset::default()
                 .handle_access(all_access)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+                .map_err(|e| std::io::Error::other(e.to_string()))?
                 .create()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-            // Helper closure for adding paths
-            let mut add_path = |path: &Path, access: AccessFs| -> std::io::Result<()> {
+            // Helper: pass ruleset by &mut so it isn't moved into the closure.
+            let add_path = |ruleset: &mut landlock::RulesetCreated,
+                            path: &Path,
+                            access|
+             -> std::io::Result<()> {
                 if !path.exists() {
                     return Ok(());
                 }
                 let fd = PathFd::new(path)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 ruleset
                     .add_rule(PathBeneath::new(fd, access))
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 Ok(())
             };
 
             // Add workspace and data_dir
-            add_path(&workspace, write_access)?;
-            add_path(&data_dir, write_access)?;
+            add_path(&mut ruleset, &workspace, write_access)?;
+            add_path(&mut ruleset, &data_dir, write_access)?;
 
             // Add mounts
             for mount in &mounts {
                 if mount.readonly {
-                    add_path(&mount.path, read_access)?;
+                    add_path(&mut ruleset, &mount.path, read_access)?;
                 } else {
-                    add_path(&mount.path, write_access)?;
+                    add_path(&mut ruleset, &mount.path, write_access)?;
                 }
             }
 
             // Add PATH directories
             for path_dir in &path_dirs {
-                add_path(path_dir, read_access)?;
+                add_path(&mut ruleset, path_dir, read_access)?;
             }
 
             // Add system paths
             for sys_path in SYSTEM_PATHS {
-                add_path(Path::new(sys_path), read_access)?;
+                add_path(&mut ruleset, Path::new(sys_path), read_access)?;
             }
 
             // Add temp paths
             for tmp_path in TEMP_PATHS {
-                add_path(Path::new(tmp_path), write_access)?;
+                add_path(&mut ruleset, Path::new(tmp_path), write_access)?;
             }
 
             // Add device and proc paths
             for dev_path in DEVICE_PATHS {
-                add_path(Path::new(dev_path), read_access)?;
+                add_path(&mut ruleset, Path::new(dev_path), read_access)?;
             }
 
             // Apply the ruleset
             ruleset
                 .restrict_self()
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
 
             // Apply network isolation
             if netns_fd >= 0 {
@@ -541,14 +544,14 @@ pub fn spawn_with_landlock(
                 // setns(CLONE_NEWNET) joins the network namespace; we are in a
                 // single-threaded post-fork child, so no other threads are affected.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                let ret = unsafe { libc::setns(netns_fd, libc::CLONE_NEWNET) };
+                let ret = libc::setns(netns_fd, libc::CLONE_NEWNET);
                 if ret != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 // SAFETY: bring_up_loopback uses ioctl in a post-fork child process.
                 // Single-threaded at this point; no locks are held from the parent.
                 // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-                unsafe { bring_up_loopback() };
+                bring_up_loopback();
             } else {
                 apply_network_isolation(&network)?;
             }

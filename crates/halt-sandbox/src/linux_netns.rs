@@ -53,6 +53,7 @@ impl NetnsConfig {
     /// The PID is used to derive both the namespace name (`halt-{pid}`) and
     /// the IP range (`10.200.{pid % 256}.0/24`). Using the PID ensures that
     /// each halt invocation gets a unique namespace name and IP range.
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::from_pid()
     }
@@ -294,6 +295,7 @@ pub fn delete_netns(name: &str) -> Result<(), SandboxError> {
 ///
 /// # Errors
 /// * `SpawnFailed` - If spawn fails
+#[allow(dead_code)]
 pub fn exec_in_netns(
     namespace: &str,
     command: &str,
@@ -328,6 +330,7 @@ pub fn exec_in_netns(
 /// # Errors
 /// * `PrivilegeRequired` - If not root/CAP_NET_ADMIN
 /// * `NetworkSetupFailed` - If setup fails
+#[allow(dead_code)]
 pub fn create_loopback_only_netns(name: &str) -> Result<(), SandboxError> {
     use std::process::Command;
 
@@ -373,6 +376,7 @@ pub fn create_loopback_only_netns(name: &str) -> Result<(), SandboxError> {
 /// # Errors
 /// * `PrivilegeRequired` - If not root/CAP_NET_ADMIN
 /// * `NetworkSetupFailed` - If setup fails
+#[allow(dead_code)]
 pub fn create_blocked_netns(name: &str) -> Result<(), SandboxError> {
     use std::process::Command;
 

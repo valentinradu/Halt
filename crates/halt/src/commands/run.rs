@@ -159,8 +159,10 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
 fn build_proxy_config(
     settings: &halt_settings::ProxySettings,
 ) -> Result<ProxyConfig, CliError> {
-    let mut config = ProxyConfig::default();
-    config.domain_allowlist = settings.domain_allowlist.clone();
+    let mut config = ProxyConfig {
+        domain_allowlist: settings.domain_allowlist.clone(),
+        ..Default::default()
+    };
 
     if let Some(ttl) = settings.dns_ttl_seconds {
         config.dns_ttl = std::time::Duration::from_secs(u64::from(ttl));
