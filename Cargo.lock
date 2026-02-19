@@ -261,7 +261,7 @@ dependencies = [
 
 [[package]]
 name = "halt"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "clap",
  "halt-proxy",
@@ -279,7 +279,7 @@ dependencies = [
 
 [[package]]
 name = "halt-proxy"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "thiserror 2.0.18",
  "tokio",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "halt-sandbox"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "dirs",
  "halt-settings",
@@ -301,7 +301,7 @@ dependencies = [
 
 [[package]]
 name = "halt-settings"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "dirs",
  "serde",

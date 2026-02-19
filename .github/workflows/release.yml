@@ -117,16 +117,18 @@ jobs:
 
       - name: Build .deb
         run: |
+          VERSION="${{ github.ref_name }}"
+          VERSION="${VERSION#v}"
           cargo deb -p halt --target ${{ matrix.target }} --no-build \
-            --deb-version ${{ github.ref_name }}
+            --deb-version "$VERSION"
           mv target/${{ matrix.target }}/debian/*.deb \
-             halt_${{ github.ref_name }}_${{ matrix.arch }}.deb
+             halt_${VERSION}_${{ matrix.arch }}.deb
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.arch }}
-          path: halt_${{ github.ref_name }}_${{ matrix.arch }}.deb
+          path: halt_*_${{ matrix.arch }}.deb
 
   # ── Create GitHub release ─────────────────────────────────────────────────
   release:
