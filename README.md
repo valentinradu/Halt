@@ -1,8 +1,5 @@
 # Halt
 
-<p align="center">
-  <img src="assets/icon.svg" width="120" alt="Halt icon"/>
-</p>
 
 Wrap AI coding agents, or any process, in a lightweight containment layer that restricts filesystem and network access using native OS mechanisms.
 
