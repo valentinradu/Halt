@@ -10,14 +10,14 @@
 # Tighter usage (ignore global/project halt.toml, use only this file):
 #   halt run --no-config --config configs/claude.toml -- claude
 #
-# NOTE: macOS Keychain access does not work under sandbox-exec (the SBPL
-# sandbox). Claude Code stores its OAuth tokens in the Keychain, so you must
-# pass your API key via environment variable instead:
+# NOTE: When running for the first time or after a token refresh, Claude Code
+# may need to access the macOS Keychain to retrieve its OAuth token. If you
+# see "Not logged in", pass your API key directly:
 #
-#   ANTHROPIC_API_KEY=sk-ant-... halt run --config configs/claude.toml -- claude
-#
-# or:
 #   halt run --config configs/claude.toml --env ANTHROPIC_API_KEY -- claude
+#
+# Alternatively, set ANTHROPIC_API_KEY in your environment and it will be
+# passed through automatically.
 
 [sandbox]
 network = { mode = "proxy_only" }
@@ -42,6 +42,8 @@ read_write = [
   "~/.claude",
   # Glob: covers .claude.json, .claude.json.lock, .claude.json.tmp.PID.TS, etc.
   "~/.claude.json*",
+  # macOS Keychain — Security framework needs read+write access for OAuth token retrieval
+  "~/Library/Keychains",
 ]
 
 [proxy]

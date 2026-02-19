@@ -135,13 +135,12 @@ impl SandboxPaths {
                 "/usr/lib".to_string(),
                 "/usr/share".to_string(),
                 "/etc".to_string(),
-                // macOS system paths needed by most processes
-                "/Library/Preferences/Logging".to_string(),
-                "/Library/Preferences/SystemConfiguration".to_string(),
+                // macOS system libraries and frameworks
+                "/Library".to_string(),
                 "/System/Library".to_string(),
                 "/System/Volumes/Preboot/Cryptexes".to_string(),
-                "/private/var/db/timezone".to_string(),
-                "/private/var/db/dyld".to_string(),
+                // macOS system databases (needed by Security framework, Keychain, timezone, dyld cache)
+                "/private/var/db".to_string(),
             ],
             read_write: vec![
                 "/tmp".to_string(),
