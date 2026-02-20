@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# test-macos-agents.sh — e2e smoke-tests halt with each macOS agent config.
+# test-macos-agents.sh - e2e smoke-tests halt with each macOS agent config.
 #
-# Tests three aspects for every agent:
-#   1. Sandbox starts:        halt runs a trivial command under the config.
-#   2. Filesystem blocking:   a write to $HOME (outside allowed paths) is denied
-#                             by sandbox-exec / SBPL; the file must not appear.
-#   3. Network filtering:     a blocked domain is rejected by the HTTP CONNECT
-#                             proxy with 403 Forbidden (curl exit 56).
+# For each agent config we validate:
+#   1. Filesystem (Seatbelt/SBPL):
+#      - workspace write succeeds (true positive)
+#      - workspace read succeeds (true positive)
+#      - write outside allowed paths is denied (true negative)
+#   2. Network proxy:
+#      - blocked domain via HTTPS CONNECT is rejected (curl exit 56)
+#      - strict mode exits 2 on blocked SOCKS5 domain CONNECT
+#      - strict mode does NOT trip on an allowlisted SOCKS5 domain
 #
 # Requirements:
-#   - halt binary (set HALT env var or defaults to ./target/release/halt)
+#   - macOS (sandbox-exec available)
+#   - halt binary (HALT env var, default: ./target/release/halt)
 #   - curl
-#   - macOS (uses sandbox-exec / SBPL under the hood)
 #
 # Usage:
 #   e2e/test-macos-agents.sh
@@ -25,57 +28,117 @@ HALT=${HALT:-./target/release/halt}
 CONFIGS_DIR=${CONFIGS_DIR:-configs}
 PASS=0
 FAIL=0
+LAST_EXIT=0
+WORKSPACE=$(mktemp -d)
+trap 'rm -rf "$WORKSPACE"' EXIT
 
 green() { printf '\033[0;32m✓ %s\033[0m\n' "$*"; }
 red()   { printf '\033[0;31m✗ %s\033[0m\n' "$*" >&2; }
 
 pass() { green "$1"; PASS=$((PASS + 1)); }
-fail() { red   "$1"; FAIL=$((FAIL + 1)); }
+fail() { red "$1"; FAIL=$((FAIL + 1)); }
+
+run_halt() {
+    local stderr_file="$1"
+    shift
+    set +e
+    "$HALT" run --no-config "$@" 2>"$stderr_file"
+    LAST_EXIT=$?
+    set -e
+    return 0
+}
+
+assert_exit() {
+    local expected="$1"
+    local actual="$2"
+    local label="$3"
+    local stderr_file="$4"
+    if [ "$actual" -eq "$expected" ]; then
+        pass "$label"
+    else
+        fail "$label (expected exit $expected, got $actual)"
+        cat "$stderr_file" >&2 || true
+    fi
+}
+
+strict_socks5_script() {
+    cat <<'SOCKS5'
+set -e
+PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$' || true)
+[ -z "$PROXY_PORT" ] && exit 1
+exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
+printf '\x05\x01\x00' >&3
+sleep 0.1
+printf '%b' "${SOCKS5_PAYLOAD:?}" >&3
+exec 3>&-
+sleep 0.3
+SOCKS5
+}
+
+blocked_socks5_payload() {
+    # SOCKS5 CONNECT request for "blocked-domain.example" (len 0x16), port 80.
+    echo '\x05\x01\x00\x03\x16blocked-domain.example\x00\x50'
+}
+
+allowed_socks5_payload_for() {
+    case "$1" in
+        # "api.anthropic.com" len 17 (0x11)
+        claude) echo '\x05\x01\x00\x03\x11api.anthropic.com\x00\x50' ;;
+        # "api.openai.com" len 14 (0x0e)
+        codex) echo '\x05\x01\x00\x03\x0eapi.openai.com\x00\x50' ;;
+        # "generativelanguage.googleapis.com" len 33 (0x21)
+        gemini) echo '\x05\x01\x00\x03\x21generativelanguage.googleapis.com\x00\x50' ;;
+        *) echo '\x05\x01\x00\x03\x0bexample.com\x00\x50' ;;
+    esac
+}
 
 for AGENT in claude codex gemini; do
     CONFIG="${CONFIGS_DIR}/${AGENT}.toml"
+    STDERR="/tmp/halt_stderr_${AGENT}_$$"
+    SENTINEL="${WORKSPACE}/sentinel-${AGENT}.txt"
+    BLOCKED_FILE="${HOME}/halt-test-blocked-${AGENT}.$$"
+    ALLOWED_SOCKS5_PAYLOAD=$(allowed_socks5_payload_for "$AGENT")
+    BLOCKED_SOCKS5_PAYLOAD=$(blocked_socks5_payload)
 
     echo ""
     echo "── ${AGENT} ─────────────────────────────────────────────────────────"
 
-    # 1. Config parses and halt starts a trivial sandboxed command.
-    if "$HALT" run --no-config --config "$CONFIG" -- /bin/echo "ok-${AGENT}" \
-           2>/tmp/halt_stderr_${AGENT}; then
-        pass "${AGENT}: sandbox starts"
+    run_halt "$STDERR" --config "$CONFIG" -- /bin/sh -c "echo ok > '${SENTINEL}'"
+    code=$LAST_EXIT
+    if [ "$code" -eq 0 ] && [ -f "$SENTINEL" ]; then
+        pass "${AGENT}: workspace write succeeds"
     else
-        fail "${AGENT}: sandbox failed (exit $?)"
-        cat /tmp/halt_stderr_${AGENT} >&2
+        fail "${AGENT}: workspace write failed (exit $code)"
+        cat "$STDERR" >&2 || true
     fi
 
-    # 2. Write outside allowed paths is blocked by sandbox-exec (SBPL).
-    #    $HOME is not in system_defaults read_write, and none of the agent
-    #    configs grant write access to arbitrary $HOME paths.  The shell exits
-    #    0 explicitly so halt exit code is not affected; we check that the file
-    #    was never created.
-    BLOCKED_FILE="${HOME}/halt-test-blocked-${AGENT}.$$"
-    "$HALT" run --no-config --config "$CONFIG" \
-        -- /bin/sh -c "echo x > '${BLOCKED_FILE}' 2>/dev/null; exit 0" || true
-    if [ ! -f "${BLOCKED_FILE}" ]; then
+    run_halt "$STDERR" --config "$CONFIG" -- /bin/cat "$SENTINEL"
+    assert_exit 0 "$LAST_EXIT" "${AGENT}: workspace read succeeds" "$STDERR"
+
+    run_halt "$STDERR" --config "$CONFIG" \
+        -- /bin/sh -c "echo x > '${BLOCKED_FILE}' 2>/dev/null; exit 0"
+    if [ ! -f "$BLOCKED_FILE" ]; then
         pass "${AGENT}: write to \$HOME blocked by sandbox"
     else
-        fail "${AGENT}: write to \$HOME was NOT blocked — SBPL not enforced"
-        rm -f "${BLOCKED_FILE}"
+        fail "${AGENT}: write to \$HOME was NOT blocked (SBPL not enforced)"
+        rm -f "$BLOCKED_FILE"
     fi
 
-    # 3. Blocked domain is rejected by the HTTP CONNECT proxy (curl exit 56).
-    #    On macOS, halt injects HTTP_PROXY=http://127.0.0.1:PORT.  curl sends
-    #    CONNECT blocked-domain.invalid:443 HTTP/1.1 and the proxy returns
-    #    403 Forbidden — curl exits 56 (CURLE_RECV_ERROR).
-    #    (Linux uses DNS interception in a network namespace and exits 6/NXDOMAIN.)
-    CURL_EXIT=0
-    "$HALT" run --no-config --config "$CONFIG" \
-        -- curl -sS --max-time 5 https://blocked-domain.invalid \
-           -o /dev/null 2>/dev/null || CURL_EXIT=$?
-    if [ "$CURL_EXIT" -eq 56 ]; then
-        pass "${AGENT}: blocked domain rejected by proxy (curl exit 56 / 403 Forbidden)"
-    else
-        fail "${AGENT}: blocked domain not filtered (curl exit ${CURL_EXIT}, expected 56)"
-    fi
+    run_halt "$STDERR" --config "$CONFIG" \
+        -- curl -sS --max-time 5 https://blocked-domain.invalid -o /dev/null
+    assert_exit 56 "$LAST_EXIT" "${AGENT}: blocked domain rejected by proxy (curl exit 56)" "$STDERR"
+
+    run_halt "$STDERR" --config "$CONFIG" --strict \
+        -- /usr/bin/env SOCKS5_PAYLOAD="${BLOCKED_SOCKS5_PAYLOAD}" \
+           /bin/bash -c "$(strict_socks5_script)"
+    assert_exit 2 "$LAST_EXIT" "${AGENT}: strict mode exits 2 on blocked SOCKS5 CONNECT" "$STDERR"
+
+    run_halt "$STDERR" --config "$CONFIG" --strict \
+        -- /usr/bin/env SOCKS5_PAYLOAD="${ALLOWED_SOCKS5_PAYLOAD}" \
+           /bin/bash -c "$(strict_socks5_script)"
+    assert_exit 0 "$LAST_EXIT" "${AGENT}: strict mode allows allowlisted SOCKS5 CONNECT domain" "$STDERR"
+
+    rm -f "$STDERR"
 done
 
 echo ""
