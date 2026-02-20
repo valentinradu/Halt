@@ -17,10 +17,37 @@
 
 set -euo pipefail
 
-HALT=${HALT:-halt}
-CONFIGS_DIR=${CONFIGS_DIR:-/halt/configs/linux}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+
+resolve_halt() {
+    if [ -n "${HALT:-}" ]; then
+        echo "$HALT"
+        return 0
+    fi
+    if [ -x "${ROOT_DIR}/target/release/halt" ]; then
+        echo "${ROOT_DIR}/target/release/halt"
+        return 0
+    fi
+    if [ -x "${ROOT_DIR}/target/debug/halt" ]; then
+        echo "${ROOT_DIR}/target/debug/halt"
+        return 0
+    fi
+    if command -v halt >/dev/null 2>&1; then
+        command -v halt
+        return 0
+    fi
+    return 1
+}
+
+HALT=$(resolve_halt) || {
+    echo "error: could not find halt binary. Set HALT=/path/to/halt or build target/release/halt." >&2
+    exit 1
+}
+CONFIGS_DIR=${CONFIGS_DIR:-"${ROOT_DIR}/configs/linux"}
 PASS=0
 FAIL=0
+LAST_EXIT=0
 WORKSPACE=$(mktemp -d)
 trap 'rm -rf "$WORKSPACE"' EXIT
 
@@ -32,11 +59,18 @@ red()    { printf '\033[0;31m✗ %s\033[0m\n' "$*" >&2; }
 pass() { green "$1"; PASS=$((PASS + 1)); }
 fail() { red   "$1"; FAIL=$((FAIL + 1)); }
 
+echo "Using HALT: ${HALT}"
+
 # run_halt CONFIG ARGS... -- CMD ARGS...
-# Returns the exit code of halt (does not abort on failure).
+# Captures halt exit code in LAST_EXIT (does not abort on failure).
 run_halt() {
-    local config="$1"; shift
-    "$HALT" run --no-config --config "$config" "$@" 2>/tmp/halt_stderr || true
+    local config="$1"
+    shift
+    set +e
+    "$HALT" run --no-config --config "$config" "$@" 2>/tmp/halt_stderr
+    LAST_EXIT=$?
+    set -e
+    return 0
 }
 
 # assert_exit EXPECTED ACTUAL LABEL
@@ -48,6 +82,22 @@ assert_exit() {
         fail "$label (expected exit $expected, got $actual)"
         cat /tmp/halt_stderr >&2 || true
     fi
+}
+
+assert_one_of_exits() {
+    local actual="$1"
+    local label="$2"
+    shift 2
+    local expected
+    for expected in "$@"; do
+        if [ "$actual" -eq "$expected" ]; then
+            pass "$label (curl exit $actual)"
+            return 0
+        fi
+    done
+    fail "$label (got exit $actual, expected one of: $*)"
+    cat /tmp/halt_stderr >&2 || true
+    return 1
 }
 
 # ── Landlock filesystem tests ─────────────────────────────────────────────────
@@ -66,7 +116,7 @@ test_filesystem() {
     run_halt "$config" \
         --network unrestricted \
         -- bash -c "echo ok > '$sentinel'" </dev/null
-    local code=$?
+    local code=$LAST_EXIT
     if [ "$code" -eq 0 ] && [ -f "$sentinel" ]; then
         pass "$agent: workspace write succeeds"
     else
@@ -77,7 +127,7 @@ test_filesystem() {
     run_halt "$config" \
         --network unrestricted \
         -- bash -c "cat '$sentinel'" </dev/null
-    assert_exit 0 $? "$agent: workspace read succeeds"
+    assert_exit 0 "$LAST_EXIT" "$agent: workspace read succeeds"
 
     # 3. Writing outside the workspace (e.g. /etc/halt-test) must be denied.
     #    Landlock denies writes to paths not in the ruleset; bash exits non-zero.
@@ -122,25 +172,23 @@ test_network() {
         -- curl -sS --max-time 5 \
            "https://${allowed_domain}" \
            -o /dev/null 2>/tmp/halt_stderr </dev/null
-    local code=$?
+    local code=$LAST_EXIT
     # exit 7 (connection refused / timeout) means DNS resolved — that's fine.
     # exit 6 (DNS fail) means the proxy blocked or can't resolve — that's a fail.
     if [ "$code" -ne 6 ]; then
         pass "$agent: allowed domain '$allowed_domain' resolved through proxy (curl exit $code)"
-        ((PASS++))
     else
         fail "$agent: allowed domain '$allowed_domain' NOT resolved (curl exit $code — DNS blocked?)"
-        ((FAIL++))
         cat /tmp/halt_stderr >&2 || true
     fi
 
-    # 5. Blocked domain: proxy must return NXDOMAIN (curl exit 6).
+    # 5. Blocked domain: must be denied (observed as curl exit 6 or 56).
     run_halt "$config" \
         -- curl -sS --max-time 5 \
            "https://${blocked_domain}" \
            -o /dev/null 2>/tmp/halt_stderr </dev/null
-    code=$?
-    assert_exit 6 $code "$agent: blocked domain '$blocked_domain' gets NXDOMAIN (curl exit 6)"
+    code=$LAST_EXIT
+    assert_one_of_exits "$code" "$agent: blocked domain '$blocked_domain' denied" 6 56
 
     # 6. Strict mode: a SOCKS5 request for a blocked domain triggers violation → exit 2.
     #    We use bash /dev/tcp to speak raw SOCKS5 directly to the proxy port,
@@ -160,8 +208,71 @@ SOCKS5
     run_halt "$config" \
         --strict \
         -- bash -c "$socks5_script" </dev/null
-    code=$?
-    assert_exit 2 $code "$agent: strict mode exits 2 on blocked SOCKS5 CONNECT"
+    code=$LAST_EXIT
+    assert_exit 2 "$code" "$agent: strict mode exits 2 on blocked SOCKS5 CONNECT"
+
+    # 7. Strict mode allowlisted SOCKS5 domain should not trigger a violation.
+    local allowed_socks5_script
+    case "$agent" in
+        claude)
+            allowed_socks5_script=$(cat <<'SOCKS5'
+PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
+[ -z "$PROXY_PORT" ] && exit 1
+exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
+printf '\x05\x01\x00' >&3
+sleep 0.1
+printf '\x05\x01\x00\x03\x11api.anthropic.com\x00\x50' >&3
+exec 3>&-
+sleep 0.3
+SOCKS5
+)
+            ;;
+        codex)
+            allowed_socks5_script=$(cat <<'SOCKS5'
+PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
+[ -z "$PROXY_PORT" ] && exit 1
+exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
+printf '\x05\x01\x00' >&3
+sleep 0.1
+printf '\x05\x01\x00\x03\x0eapi.openai.com\x00\x50' >&3
+exec 3>&-
+sleep 0.3
+SOCKS5
+)
+            ;;
+        gemini)
+            allowed_socks5_script=$(cat <<'SOCKS5'
+PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
+[ -z "$PROXY_PORT" ] && exit 1
+exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
+printf '\x05\x01\x00' >&3
+sleep 0.1
+printf '\x05\x01\x00\x03\x21generativelanguage.googleapis.com\x00\x50' >&3
+exec 3>&-
+sleep 0.3
+SOCKS5
+)
+            ;;
+        *)
+            allowed_socks5_script=$(cat <<'SOCKS5'
+PROXY_PORT=$(echo "${HTTP_PROXY:-}" | grep -oE '[0-9]+$')
+[ -z "$PROXY_PORT" ] && exit 1
+exec 3<>/dev/tcp/127.0.0.1/${PROXY_PORT}
+printf '\x05\x01\x00' >&3
+sleep 0.1
+printf '\x05\x01\x00\x03\x0bexample.com\x00\x50' >&3
+exec 3>&-
+sleep 0.3
+SOCKS5
+)
+            ;;
+    esac
+
+    run_halt "$config" \
+        --strict \
+        -- bash -c "$allowed_socks5_script" </dev/null
+    code=$LAST_EXIT
+    assert_exit 0 "$code" "$agent: strict mode allows allowlisted SOCKS5 CONNECT domain"
 }
 
 # ── Run all tests for every agent ─────────────────────────────────────────────

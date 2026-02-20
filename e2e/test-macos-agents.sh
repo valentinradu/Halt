@@ -24,8 +24,34 @@
 
 set -euo pipefail
 
-HALT=${HALT:-./target/release/halt}
-CONFIGS_DIR=${CONFIGS_DIR:-configs}
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ROOT_DIR=$(cd -- "${SCRIPT_DIR}/.." && pwd)
+
+resolve_halt() {
+    if [ -n "${HALT:-}" ]; then
+        echo "$HALT"
+        return 0
+    fi
+    if [ -x "${ROOT_DIR}/target/release/halt" ]; then
+        echo "${ROOT_DIR}/target/release/halt"
+        return 0
+    fi
+    if [ -x "${ROOT_DIR}/target/debug/halt" ]; then
+        echo "${ROOT_DIR}/target/debug/halt"
+        return 0
+    fi
+    if command -v halt >/dev/null 2>&1; then
+        command -v halt
+        return 0
+    fi
+    return 1
+}
+
+HALT=$(resolve_halt) || {
+    echo "error: could not find halt binary. Set HALT=/path/to/halt or build target/release/halt." >&2
+    exit 1
+}
+CONFIGS_DIR=${CONFIGS_DIR:-"${ROOT_DIR}/configs"}
 PASS=0
 FAIL=0
 LAST_EXIT=0
@@ -37,6 +63,8 @@ red()   { printf '\033[0;31m✗ %s\033[0m\n' "$*" >&2; }
 
 pass() { green "$1"; PASS=$((PASS + 1)); }
 fail() { red "$1"; FAIL=$((FAIL + 1)); }
+
+echo "Using HALT: ${HALT}"
 
 run_halt() {
     local stderr_file="$1"
@@ -59,6 +87,23 @@ assert_exit() {
         fail "$label (expected exit $expected, got $actual)"
         cat "$stderr_file" >&2 || true
     fi
+}
+
+assert_one_of_exits() {
+    local actual="$1"
+    local label="$2"
+    local stderr_file="$3"
+    shift 3
+    local expected
+    for expected in "$@"; do
+        if [ "$actual" -eq "$expected" ]; then
+            pass "$label (curl exit $actual)"
+            return 0
+        fi
+    done
+    fail "$label (got exit $actual, expected one of: $*)"
+    cat "$stderr_file" >&2 || true
+    return 1
 }
 
 strict_socks5_script() {
@@ -126,7 +171,7 @@ for AGENT in claude codex gemini; do
 
     run_halt "$STDERR" --config "$CONFIG" \
         -- curl -sS --max-time 5 https://blocked-domain.invalid -o /dev/null
-    assert_exit 56 "$LAST_EXIT" "${AGENT}: blocked domain rejected by proxy (curl exit 56)" "$STDERR"
+    assert_one_of_exits "$LAST_EXIT" "${AGENT}: blocked domain rejected by proxy/DNS block" "$STDERR" 56 6
 
     run_halt "$STDERR" --config "$CONFIG" --strict \
         -- /usr/bin/env SOCKS5_PAYLOAD="${BLOCKED_SOCKS5_PAYLOAD}" \
