@@ -29,8 +29,8 @@ trap 'rm -rf "$WORKSPACE"' EXIT
 green()  { printf '\033[0;32m✓ %s\033[0m\n' "$*"; }
 red()    { printf '\033[0;31m✗ %s\033[0m\n' "$*" >&2; }
 
-pass() { green "$1"; ((PASS++)); }
-fail() { red   "$1"; ((FAIL++)); }
+pass() { green "$1"; PASS=$((PASS + 1)); }
+fail() { red   "$1"; FAIL=$((FAIL + 1)); }
 
 # run_halt CONFIG ARGS... -- CMD ARGS...
 # Returns the exit code of halt (does not abort on failure).
@@ -69,10 +69,8 @@ test_filesystem() {
     local code=$?
     if [ "$code" -eq 0 ] && [ -f "$sentinel" ]; then
         pass "$agent: workspace write succeeds"
-        ((PASS++))
     else
         fail "$agent: workspace write failed (exit $code)"
-        ((FAIL++))
     fi
 
     # 2. Reading a file written inside the workspace must succeed.
@@ -90,10 +88,8 @@ test_filesystem() {
     # silently fails with EACCES — we verify the file was NOT created.
     if [ ! -f "/etc/halt-test-${agent}" ]; then
         pass "$agent: write to /etc blocked by Landlock"
-        ((PASS++))
     else
         fail "$agent: write to /etc was NOT blocked — Landlock not enforced"
-        ((FAIL++))
         rm -f "/etc/halt-test-${agent}"
     fi
 }

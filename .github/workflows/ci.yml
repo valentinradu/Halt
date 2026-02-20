@@ -109,9 +109,9 @@ jobs:
             /halt/e2e/test-linux-agents.sh
 
   # ── macOS agent config smoke tests ───────────────────────────────────────
-  # Builds halt natively on macOS and runs a lightweight check that each
-  # agent config parses and that halt starts a sandboxed process with it.
-  # Full Keychain / SBPL tests are handled by the main test matrix above.
+  # Builds halt natively on macOS and runs e2e/test-macos-agents.sh which
+  # verifies for each agent: sandbox starts, $HOME writes are blocked by SBPL,
+  # and blocked domains return NXDOMAIN through the proxy.
   test-macos-agents:
     name: Agent configs (macOS)
     runs-on: macos-latest
