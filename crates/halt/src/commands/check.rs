@@ -57,7 +57,11 @@ pub async fn check(cwd: PathBuf) -> Result<(), CliError> {
     } else {
         println!("  global: n/a (home directory not available)");
     }
-    let status = if project_path.exists() { "found" } else { "not found" };
+    let status = if project_path.exists() {
+        "found"
+    } else {
+        "not found"
+    };
     println!("  {} ({})", project_path.display(), status);
 
     match ConfigLoader::load(&cwd) {
@@ -69,9 +73,7 @@ pub async fn check(cwd: PathBuf) -> Result<(), CliError> {
     }
 
     if !all_ok {
-        return Err(CliError::Other(
-            "One or more checks failed".to_string(),
-        ));
+        return Err(CliError::Other("One or more checks failed".to_string()));
     }
 
     Ok(())

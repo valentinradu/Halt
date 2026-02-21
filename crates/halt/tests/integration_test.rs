@@ -122,10 +122,7 @@ fn test_config_init_creates_project_config() {
     expect_success(&out);
 
     let config_path = dir.path().join(".halt").join("halt.toml");
-    assert!(
-        config_path.exists(),
-        ".halt/halt.toml was not created"
-    );
+    assert!(config_path.exists(), ".halt/halt.toml was not created");
     let contents = fs::read_to_string(&config_path).unwrap();
     assert!(
         toml::from_str::<toml::Value>(&contents).is_ok(),
@@ -219,7 +216,9 @@ fn test_config_project_overrides_domain_allowlist() {
         .as_array()
         .expect("domain_allowlist should be an array");
     assert!(
-        allowlist.iter().any(|v| v.as_str() == Some("project-domain.example")),
+        allowlist
+            .iter()
+            .any(|v| v.as_str() == Some("project-domain.example")),
         "Expected project-domain.example in allowlist, got: {allowlist:?}"
     );
 }
@@ -254,11 +253,7 @@ fn test_run_reads_file_in_workspace() {
     let dir = TempDir::new().unwrap();
     fs::write(dir.path().join("hello.txt"), "hello-workspace\n").unwrap();
 
-    let out = sandboxed_run(
-        dir.path(),
-        &sys_exec_args(),
-        &["/bin/cat", "hello.txt"],
-    );
+    let out = sandboxed_run(dir.path(), &sys_exec_args(), &["/bin/cat", "hello.txt"]);
     let stdout = expect_success(&out);
     assert!(
         stdout.contains("hello-workspace"),
@@ -518,11 +513,7 @@ fn test_run_env_flag_passes_named_variable() {
     let dir = TempDir::new().unwrap();
     let mut extra = sys_exec_args();
     extra.extend_from_slice(&["--env".into(), "HOME".into()]);
-    let out = sandboxed_run(
-        dir.path(),
-        &extra,
-        &["/bin/sh", "-c", "echo HOME=$HOME"],
-    );
+    let out = sandboxed_run(dir.path(), &extra, &["/bin/sh", "-c", "echo HOME=$HOME"]);
     let stdout = expect_success(&out);
     assert!(
         stdout.contains("HOME=/"),
@@ -657,12 +648,7 @@ fn test_example_gemini_config_has_google_domains() {
 fn test_example_configs_have_common_registries() {
     // All three configs should grant access to the package registries that
     // agents commonly need (npm, PyPI, crates.io, GitHub).
-    let required = [
-        "registry.npmjs.org",
-        "pypi.org",
-        "crates.io",
-        "github.com",
-    ];
+    let required = ["registry.npmjs.org", "pypi.org", "crates.io", "github.com"];
     let dir = configs_dir();
     for config in &["claude.toml", "codex.toml", "gemini.toml"] {
         let json = show_example_config(&dir.join(config));
@@ -770,7 +756,10 @@ fn test_proxy_mode_allows_localhost_mcp_connection() {
         ],
     );
     let stdout = expect_success(&out);
-    assert!(stdout.contains("MCP_DONE"), "Shell did not complete: {stdout}");
+    assert!(
+        stdout.contains("MCP_DONE"),
+        "Shell did not complete: {stdout}"
+    );
     assert!(
         !stdout.contains("Operation not permitted"),
         "Sandbox blocked localhost MCP connection: {stdout}"
@@ -813,7 +802,9 @@ fn test_run_extra_config_merges_domain_allowlist() {
         .as_array()
         .expect("domain_allowlist should be an array");
     assert!(
-        allowlist.iter().any(|v| v.as_str() == Some("base-domain.example")),
+        allowlist
+            .iter()
+            .any(|v| v.as_str() == Some("base-domain.example")),
         "Expected base-domain.example in allowlist, got: {allowlist:?}"
     );
 }
@@ -880,11 +871,7 @@ fn test_strict_mode_exits_on_socks5_domain_violation() {
         "sleep 0.3"
     );
 
-    let out = strict_run(
-        dir.path(),
-        &extra,
-        &["/bin/bash", "-c", script],
-    );
+    let out = strict_run(dir.path(), &extra, &["/bin/bash", "-c", script]);
 
     // halt --strict exits 2 on violation; the child is killed first.
     assert_eq!(
@@ -916,11 +903,7 @@ fn test_strict_mode_does_not_trigger_on_allowed_domain() {
     // Allow "localhost" style so the child can bind/connect loopback.
     extra.extend_from_slice(&["--allow".into(), "localhost".into()]);
 
-    let out = strict_run(
-        dir.path(),
-        &extra,
-        &["/bin/echo", "strict-ok"],
-    );
+    let out = strict_run(dir.path(), &extra, &["/bin/echo", "strict-ok"]);
     let stdout = expect_success(&out);
     assert!(
         stdout.contains("strict-ok"),

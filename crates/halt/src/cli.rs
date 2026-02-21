@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "halt", about = "Run processes under filesystem and network containment")]
+#[command(
+    name = "halt",
+    about = "Run processes under filesystem and network containment"
+)]
 pub struct Cli {
     /// Increase log verbosity (-v, -vv, -vvv)
     #[arg(short, long, action = ArgAction::Count, global = true)]

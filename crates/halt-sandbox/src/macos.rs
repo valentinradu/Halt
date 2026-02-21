@@ -110,7 +110,10 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
         } else {
             validate_path_for_sbpl(path)?;
             let escaped = escape_sbpl_path(path);
-            profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", escaped));
+            profile.push_str(&format!(
+                "(allow file-read-data (literal \"{}\"))\n",
+                escaped
+            ));
         }
     }
 
@@ -118,7 +121,10 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
     let mut parent = config.workspace.parent();
     while let Some(p) = parent {
         let canonical = canonicalize_for_sbpl(p);
-        profile.push_str(&format!("(allow file-read-data (literal \"{}\"))\n", canonical));
+        profile.push_str(&format!(
+            "(allow file-read-data (literal \"{}\"))\n",
+            canonical
+        ));
         parent = p.parent();
     }
 
@@ -148,7 +154,11 @@ pub fn generate_sbpl_profile(config: &SandboxConfig) -> Result<String, SandboxEr
 
     // Workspace - always read/write (validated as user-supplied input)
     validate_path_for_sbpl(&config.workspace)?;
-    add_sbpl_path_rule(&mut profile, &config.workspace, "file-read-data file-write*");
+    add_sbpl_path_rule(
+        &mut profile,
+        &config.workspace,
+        "file-read-data file-write*",
+    );
 
     // TMPDIR if set
     if let Ok(tmpdir) = std::env::var("TMPDIR") {
@@ -235,10 +245,7 @@ fn add_sbpl_glob_rule(profile: &mut String, path: &Path, access: &str) {
         .map(|p| p.to_string_lossy().replace('.', "\\."))
         .unwrap_or_else(|_| escaped_regex.clone());
 
-    profile.push_str(&format!(
-        "(allow {} (regex \"^{}\"))\n",
-        access, canonical
-    ));
+    profile.push_str(&format!("(allow {} (regex \"^{}\"))\n", access, canonical));
     if escaped_regex != canonical {
         profile.push_str(&format!(
             "(allow {} (regex \"^{}\"))\n",
@@ -287,7 +294,6 @@ fn add_sbpl_path_rule(profile: &mut String, path: &Path, access: &str) {
         }
     }
 }
-
 
 /// Check if a file is executable
 fn is_executable(path: &Path) -> bool {
@@ -528,22 +534,16 @@ mod tests {
 
     #[test]
     fn test_sbpl_profile_has_version() {
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            make_test_paths(),
-            "/workspace".into(),
-        );
+        let config =
+            SandboxConfig::new("/workspace".into(), make_test_paths(), "/workspace".into());
         let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(version 1)"));
     }
 
     #[test]
     fn test_sbpl_profile_has_allow_default() {
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            make_test_paths(),
-            "/workspace".into(),
-        );
+        let config =
+            SandboxConfig::new("/workspace".into(), make_test_paths(), "/workspace".into());
         let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(allow default)"));
     }
@@ -566,23 +566,16 @@ mod tests {
             read: vec![],
             read_write: vec![],
         };
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            paths,
-            "/workspace".into(),
-        );
+        let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());
         let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(literal \"/custom/traversal\")"));
     }
 
     #[test]
     fn test_sbpl_profile_includes_network_rules_when_blocked() {
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            make_test_paths(),
-            "/workspace".into(),
-        )
-        .with_network(NetworkMode::Blocked);
+        let config =
+            SandboxConfig::new("/workspace".into(), make_test_paths(), "/workspace".into())
+                .with_network(NetworkMode::Blocked);
         let profile = generate_sbpl_profile(&config).unwrap();
         assert!(profile.contains("(deny network*)"));
     }
@@ -594,13 +587,12 @@ mod tests {
             read: vec![],
             read_write: vec![],
         };
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            paths,
-            "/workspace".into(),
-        );
+        let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());
         let result = generate_sbpl_profile(&config);
-        assert!(result.is_err(), "Path with SBPL control characters should be rejected");
+        assert!(
+            result.is_err(),
+            "Path with SBPL control characters should be rejected"
+        );
     }
 
     #[test]
@@ -610,11 +602,7 @@ mod tests {
             read: vec!["/path/with/*/wildcard".to_string()],
             read_write: vec![],
         };
-        let config = SandboxConfig::new(
-            "/workspace".into(),
-            paths,
-            "/workspace".into(),
-        );
+        let config = SandboxConfig::new("/workspace".into(), paths, "/workspace".into());
         let result = generate_sbpl_profile(&config);
         assert!(result.is_err(), "Path with * should be rejected");
     }

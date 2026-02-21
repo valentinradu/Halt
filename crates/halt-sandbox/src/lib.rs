@@ -238,8 +238,8 @@ mod tests {
         std::fs::create_dir_all(&workspace).ok();
 
         let paths = SandboxPaths::system_defaults();
-        let config = SandboxConfig::new(workspace.clone(), paths, workspace)
-            .with_env(build_env(&[]));
+        let config =
+            SandboxConfig::new(workspace.clone(), paths, workspace).with_env(build_env(&[]));
         TestDirs {
             config,
             _temp: temp,
@@ -266,10 +266,7 @@ mod tests {
                 }
             }
             Err(SandboxError::SpawnFailed(err))
-                if err.kind() == std::io::ErrorKind::PermissionDenied =>
-            {
-                return;
-            }
+                if err.kind() == std::io::ErrorKind::PermissionDenied => {}
             Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
         }
     }
@@ -285,6 +282,11 @@ mod tests {
                 Ok(mut child) => {
                     let status = child.wait().expect("Failed to wait");
                     assert!(status.success());
+                }
+                Err(SandboxError::SpawnFailed(err))
+                    if err.kind() == std::io::ErrorKind::PermissionDenied =>
+                {
+                    return;
                 }
                 Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
             }
@@ -304,24 +306,29 @@ mod tests {
     // and is exercised end-to-end by the integration tests in halt/tests/.
     // =========================================================================
 
-    /// Spawn a command inside the sandbox and return its exit code, or `None`
-    /// if spawning itself failed.
+    /// Spawn a command inside the sandbox and return its exit code.
     #[cfg(target_os = "linux")]
-    fn sandboxed_exit(config: &SandboxConfig, cmd: &str, args: &[&str]) -> Option<i32> {
+    fn sandboxed_exit(
+        config: &SandboxConfig,
+        cmd: &str,
+        args: &[&str],
+    ) -> Result<Option<i32>, SandboxError> {
         let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        spawn_sandboxed(config, cmd, &args)
-            .ok()?
-            .wait()
-            .ok()
-            .and_then(|s| s.code())
+        let mut child = spawn_sandboxed(config, cmd, &args)?;
+        let status = child.wait().map_err(SandboxError::SpawnFailed)?;
+        Ok(status.code())
     }
 
     /// Build a test config with the given network mode and no extra paths.
     #[cfg(target_os = "linux")]
     fn linux_test_config(workspace: std::path::PathBuf, network: NetworkMode) -> SandboxConfig {
-        SandboxConfig::new(workspace.clone(), SandboxPaths::system_defaults(), workspace)
-            .with_network(network)
-            .with_env(build_env(&[]))
+        SandboxConfig::new(
+            workspace.clone(),
+            SandboxPaths::system_defaults(),
+            workspace,
+        )
+        .with_network(network)
+        .with_env(build_env(&[]))
     }
 
     #[test]
@@ -338,8 +345,20 @@ mod tests {
         std::fs::write(&test_file, "hello landlock").unwrap();
 
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap()]);
-        assert_eq!(code, Some(0), "cat should succeed for a file inside the workspace");
+        let code = match sandboxed_exit(&config, "/bin/cat", &[test_file.to_str().unwrap()]) {
+            Ok(code) => code,
+            Err(SandboxError::SpawnFailed(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+        };
+        assert_eq!(
+            code,
+            Some(0),
+            "cat should succeed for a file inside the workspace"
+        );
     }
 
     #[test]
@@ -359,7 +378,15 @@ mod tests {
         let workspace = temp.path().to_path_buf();
 
         let config = linux_test_config(workspace, NetworkMode::LocalhostOnly);
-        let code = sandboxed_exit(&config, "/bin/cat", &["/sys/kernel/version"]);
+        let code = match sandboxed_exit(&config, "/bin/cat", &["/sys/kernel/version"]) {
+            Ok(code) => code,
+            Err(SandboxError::SpawnFailed(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+        };
         assert!(
             code != Some(0),
             "cat /sys/kernel/version should fail because /sys is not in the Landlock allowlist"
@@ -386,11 +413,19 @@ mod tests {
         // bash's /dev/tcp pseudo-device requires no external binaries and
         // will fail with ENETUNREACH / EADDRNOTAVAIL when the network namespace
         // has no routes — a reliable signal that the namespace is isolated.
-        let code = sandboxed_exit(
+        let code = match sandboxed_exit(
             &config,
             "/bin/bash",
             &["-c", "exec 3<>/dev/tcp/1.1.1.1/80 2>/dev/null"],
-        );
+        ) {
+            Ok(code) => code,
+            Err(SandboxError::SpawnFailed(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+        };
         assert!(
             code != Some(0),
             "TCP connection to external IP should fail in Blocked network mode"
@@ -417,11 +452,19 @@ mod tests {
         // Port 1 on localhost is never open; bash exits non-zero with ECONNREFUSED.
         // What matters is that the error is NOT "network unreachable" — meaning
         // the loopback interface exists and routes work.
-        let code = sandboxed_exit(
+        let code = match sandboxed_exit(
             &config,
             "/bin/bash",
             &["-c", "exec 3<>/dev/tcp/127.0.0.1/1 2>/dev/null; echo $?"],
-        );
+        ) {
+            Ok(code) => code,
+            Err(SandboxError::SpawnFailed(err))
+                if err.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                return;
+            }
+            Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
+        };
         // The child exits non-zero (ECONNREFUSED), but it must exit — not hang.
         // A hang or ENETUNREACH exit would indicate the loopback interface is down.
         assert!(

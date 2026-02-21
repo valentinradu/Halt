@@ -22,8 +22,9 @@
 //! ```
 //!
 
-
-use crate::{DnsServer, DnsServerConfig, ProxyError, Result, SharedState, TcpProxy, TcpProxyConfig};
+use crate::{
+    DnsServer, DnsServerConfig, ProxyError, Result, SharedState, TcpProxy, TcpProxyConfig,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::oneshot;
@@ -96,7 +97,7 @@ impl ProxyConfig {
     /// - Aider: `api.openai.com`, `api.anthropic.com`, `*.aider.chat`
     /// - Common: `*.github.com`, `*.githubusercontent.com`, `pypi.org`, `npmjs.org`
     ///
-    /// 
+    ///
     pub fn with_allowlist(domains: Vec<String>) -> Self {
         Self {
             domain_allowlist: domains,
@@ -415,7 +416,10 @@ mod tests {
     fn test_proxy_config_default_timeouts() {
         let config = ProxyConfig::default();
         assert_eq!(config.dns_ttl, std::time::Duration::from_secs(300));
-        assert_eq!(config.tcp_connect_timeout, std::time::Duration::from_secs(30));
+        assert_eq!(
+            config.tcp_connect_timeout,
+            std::time::Duration::from_secs(30)
+        );
         assert_eq!(config.tcp_idle_timeout, std::time::Duration::from_secs(300));
     }
 
@@ -955,7 +959,10 @@ mod tests {
         let server = ProxyServer::new(config).unwrap();
         // start() now pre-binds before spawning; bind error surfaces immediately.
         let result = server.start().await;
-        assert!(result.is_err(), "start() should fail when DNS port is in use");
+        assert!(
+            result.is_err(),
+            "start() should fail when DNS port is in use"
+        );
     }
 
     #[tokio::test]
@@ -974,7 +981,10 @@ mod tests {
         let server = ProxyServer::new(config).unwrap();
         // start() now pre-binds before spawning; bind error surfaces immediately.
         let result = server.start().await;
-        assert!(result.is_err(), "start() should fail when proxy port is in use");
+        assert!(
+            result.is_err(),
+            "start() should fail when proxy port is in use"
+        );
     }
 
     #[tokio::test]

@@ -65,6 +65,9 @@ fn default_proxy_addr() -> std::net::SocketAddr {
     std::net::SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+type ExpandedPath = (PathBuf, bool);
+type ExpandedPathLists = (Vec<ExpandedPath>, Vec<ExpandedPath>, Vec<ExpandedPath>);
+
 /// Filesystem paths made available to the sandboxed process.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxPaths {
@@ -90,11 +93,11 @@ impl SandboxPaths {
     /// with `*`; the `*` is stripped from the returned `PathBuf` and callers
     /// should treat the path as a prefix (matching the path and everything
     /// under / starting with it).
-    pub fn expand_paths(&self) -> (Vec<(PathBuf, bool)>, Vec<(PathBuf, bool)>, Vec<(PathBuf, bool)>) {
+    pub fn expand_paths(&self) -> ExpandedPathLists {
         let home = dirs::home_dir();
-        let expand = |s: &str| -> (PathBuf, bool) {
-            let (s, is_glob) = if s.ends_with('*') {
-                (&s[..s.len() - 1], true)
+        let expand = |s: &str| -> ExpandedPath {
+            let (s, is_glob) = if let Some(stripped) = s.strip_suffix('*') {
+                (stripped, true)
             } else {
                 (s, false)
             };
@@ -271,16 +274,24 @@ impl HaltConfig {
             self.sandbox.network = other.sandbox.network;
         }
         // sandbox lists: global + project (deduplicated)
-        self.sandbox.paths.traversal.extend(other.sandbox.paths.traversal);
+        self.sandbox
+            .paths
+            .traversal
+            .extend(other.sandbox.paths.traversal);
         dedup_preserve_order(&mut self.sandbox.paths.traversal);
         self.sandbox.paths.read.extend(other.sandbox.paths.read);
         dedup_preserve_order(&mut self.sandbox.paths.read);
-        self.sandbox.paths.read_write.extend(other.sandbox.paths.read_write);
+        self.sandbox
+            .paths
+            .read_write
+            .extend(other.sandbox.paths.read_write);
         dedup_preserve_order(&mut self.sandbox.paths.read_write);
         self.sandbox.mounts.extend(other.sandbox.mounts);
 
         // proxy lists: global + project (deduplicated)
-        self.proxy.domain_allowlist.extend(other.proxy.domain_allowlist);
+        self.proxy
+            .domain_allowlist
+            .extend(other.proxy.domain_allowlist);
         dedup_preserve_order(&mut self.proxy.domain_allowlist);
         // proxy scalars: project wins if set
         if other.proxy.upstream_dns.is_some() {
@@ -322,7 +333,10 @@ mod tests {
         let toml = "[proxy]\ndomain_allowlist = [\"example.com\", \"*.github.com\"]";
         let config = HaltConfig::parse(toml).unwrap();
         assert_eq!(config.proxy.domain_allowlist.len(), 2);
-        assert!(config.proxy.domain_allowlist.contains(&"example.com".to_string()));
+        assert!(config
+            .proxy
+            .domain_allowlist
+            .contains(&"example.com".to_string()));
     }
 
     #[test]
@@ -345,7 +359,8 @@ mod tests {
 
     #[test]
     fn test_parse_sandbox_paths() {
-        let toml = "[sandbox.paths]\ntraversal = [\"/\"]\nread = [\"/usr/lib\"]\nread_write = [\"/tmp\"]";
+        let toml =
+            "[sandbox.paths]\ntraversal = [\"/\"]\nread = [\"/usr/lib\"]\nread_write = [\"/tmp\"]";
         let config = HaltConfig::parse(toml).unwrap();
         assert_eq!(config.sandbox.paths.traversal, vec!["/"]);
         assert_eq!(config.sandbox.paths.read, vec!["/usr/lib"]);
@@ -356,8 +371,7 @@ mod tests {
     fn test_merge_scalar_project_wins() {
         let global =
             HaltConfig::parse("[sandbox]\nnetwork = { mode = \"localhost_only\" }").unwrap();
-        let project =
-            HaltConfig::parse("[sandbox]\nnetwork = { mode = \"blocked\" }").unwrap();
+        let project = HaltConfig::parse("[sandbox]\nnetwork = { mode = \"blocked\" }").unwrap();
         let merged = global.merge(project);
         assert_eq!(merged.sandbox.network, Some(NetworkMode::Blocked));
     }
@@ -373,14 +387,18 @@ mod tests {
 
     #[test]
     fn test_merge_lists_extend() {
-        let global =
-            HaltConfig::parse("[proxy]\ndomain_allowlist = [\"example.com\"]").unwrap();
-        let project =
-            HaltConfig::parse("[proxy]\ndomain_allowlist = [\"*.github.com\"]").unwrap();
+        let global = HaltConfig::parse("[proxy]\ndomain_allowlist = [\"example.com\"]").unwrap();
+        let project = HaltConfig::parse("[proxy]\ndomain_allowlist = [\"*.github.com\"]").unwrap();
         let merged = global.merge(project);
         assert_eq!(merged.proxy.domain_allowlist.len(), 2);
-        assert!(merged.proxy.domain_allowlist.contains(&"example.com".to_string()));
-        assert!(merged.proxy.domain_allowlist.contains(&"*.github.com".to_string()));
+        assert!(merged
+            .proxy
+            .domain_allowlist
+            .contains(&"example.com".to_string()));
+        assert!(merged
+            .proxy
+            .domain_allowlist
+            .contains(&"*.github.com".to_string()));
     }
 
     #[test]
@@ -389,7 +407,10 @@ mod tests {
         let config = HaltConfig::parse(toml).unwrap();
         let serialized = config.to_toml().unwrap();
         let reparsed = HaltConfig::parse(&serialized).unwrap();
-        assert_eq!(reparsed.proxy.domain_allowlist, vec!["example.com".to_string()]);
+        assert_eq!(
+            reparsed.proxy.domain_allowlist,
+            vec!["example.com".to_string()]
+        );
     }
 
     #[test]
@@ -403,7 +424,10 @@ mod tests {
         config.save(&path).unwrap();
 
         let loaded = HaltConfig::load(&path).unwrap();
-        assert_eq!(loaded.proxy.domain_allowlist, vec!["test.local".to_string()]);
+        assert_eq!(
+            loaded.proxy.domain_allowlist,
+            vec!["test.local".to_string()]
+        );
     }
 
     #[test]

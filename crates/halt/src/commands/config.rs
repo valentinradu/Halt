@@ -5,10 +5,7 @@ use halt_settings::{ConfigLoader, HaltConfig};
 use crate::cli::{ConfigSubcommand, OutputFormat};
 use crate::error::CliError;
 
-pub async fn config(
-    args: crate::cli::ConfigArgs,
-    cwd: PathBuf,
-) -> Result<(), CliError> {
+pub async fn config(args: crate::cli::ConfigArgs, cwd: PathBuf) -> Result<(), CliError> {
     match args.subcommand {
         ConfigSubcommand::Init { global } => init(global, &cwd).await,
         ConfigSubcommand::Show { format } => show(format, &cwd).await,

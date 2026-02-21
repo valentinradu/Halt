@@ -14,7 +14,6 @@
 //! | `**.example.com` | `a.b.example.com`, `x.y.z.example.com` | `example.com` |
 //!
 
-
 use std::collections::HashSet;
 
 /// Result of a domain match check.

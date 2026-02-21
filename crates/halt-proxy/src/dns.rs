@@ -28,7 +28,6 @@
 //! ```
 //!
 
-
 use crate::{ProxyError, Result, SharedState};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -274,8 +273,7 @@ impl DnsServer {
         let resolved = crate::ResolvedAddress {
             domain: domain_lower.clone(),
             addresses: addresses.clone(),
-            expires_at: std::time::Instant::now()
-                + self.config.ttl,
+            expires_at: std::time::Instant::now() + self.config.ttl,
         };
         self.state.insert_resolved(resolved);
 
@@ -411,11 +409,9 @@ impl DnsServer {
                 }
 
                 let mut buf = [0u8; 512];
-                let result = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    socket.recv(&mut buf),
-                )
-                .await;
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), socket.recv(&mut buf))
+                        .await;
 
                 if let Ok(Ok(len)) = result {
                     if let Some(addresses) = Self::parse_dns_response(&buf[..len]) {

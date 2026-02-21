@@ -28,8 +28,7 @@ impl ConfigLoader {
         } else {
             HaltConfig::default()
         };
-        let project = Self::load_file(&Self::project_config_path(workspace))?
-            .unwrap_or_default();
+        let project = Self::load_file(&Self::project_config_path(workspace))?.unwrap_or_default();
         Ok(global.merge(project))
     }
 
@@ -93,7 +92,10 @@ mod tests {
         .unwrap();
 
         let config = ConfigLoader::load(dir.path()).unwrap();
-        assert_eq!(config.proxy.domain_allowlist, vec!["example.com".to_string()]);
+        assert_eq!(
+            config.proxy.domain_allowlist,
+            vec!["example.com".to_string()]
+        );
     }
 
     #[test]
@@ -146,7 +148,13 @@ mod tests {
         let project = HaltConfig::load(&halt_dir.join("halt.toml")).unwrap();
         let merged = global.merge(project);
 
-        assert!(merged.proxy.domain_allowlist.contains(&"global.com".to_string()));
-        assert!(merged.proxy.domain_allowlist.contains(&"project.com".to_string()));
+        assert!(merged
+            .proxy
+            .domain_allowlist
+            .contains(&"global.com".to_string()));
+        assert!(merged
+            .proxy
+            .domain_allowlist
+            .contains(&"project.com".to_string()));
     }
 }

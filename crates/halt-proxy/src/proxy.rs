@@ -24,7 +24,6 @@
 //! - **SOCKS5**: Standard SOCKS5 proxy protocol
 //!
 
-
 use crate::{ProxyError, Result, SharedState};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -54,7 +53,9 @@ pub struct TcpProxyConfig {
 impl Default for TcpProxyConfig {
     fn default() -> Self {
         Self {
-            bind_addr: "127.0.0.1:9300".parse().expect("hardcoded loopback address"),
+            bind_addr: "127.0.0.1:9300"
+                .parse()
+                .expect("hardcoded loopback address"),
             connect_timeout: std::time::Duration::from_secs(30),
             idle_timeout: std::time::Duration::from_secs(300),
             max_connections: 1000,
@@ -201,11 +202,7 @@ impl TcpProxy {
     }
 
     /// Handle a SOCKS5 connection (first byte was already read).
-    async fn handle_socks5(
-        &self,
-        mut client: TcpStream,
-        first_byte: u8,
-    ) -> Result<()> {
+    async fn handle_socks5(&self, mut client: TcpStream, first_byte: u8) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Read the rest of the SOCKS5 greeting (up to 257 more bytes after the first).
@@ -233,7 +230,10 @@ impl TcpProxy {
             .map_err(|e| ProxyError::Internal(format!("Failed to read SOCKS5 request: {e}")))?;
 
         if n < 10 {
-            client.write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE)).await.ok();
+            client
+                .write_all(&self.build_socks5_error(socks5::GENERAL_FAILURE))
+                .await
+                .ok();
             return Err(ProxyError::Internal("SOCKS5 request too short".to_string()));
         }
 
@@ -242,7 +242,10 @@ impl TcpProxy {
         let dest = match self.resolve_socks5_destination(&request[..n]).await {
             Ok(d) => d,
             Err(e) => {
-                client.write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED)).await.ok();
+                client
+                    .write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
+                    .await
+                    .ok();
                 return Err(e);
             }
         };
@@ -250,7 +253,10 @@ impl TcpProxy {
         // For IP-based requests, verify the IP was resolved through our DNS.
         if request[3] != 0x03 {
             if let Err(e) = self.verify_destination(&dest) {
-                client.write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED)).await.ok();
+                client
+                    .write_all(&self.build_socks5_error(socks5::CONNECTION_NOT_ALLOWED))
+                    .await
+                    .ok();
                 return Err(e);
             }
         }
@@ -267,9 +273,11 @@ impl TcpProxy {
             }
         };
 
-        let local_addr = destination
-            .local_addr()
-            .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("hardcoded zero-address fallback"));
+        let local_addr = destination.local_addr().unwrap_or_else(|_| {
+            "0.0.0.0:0"
+                .parse()
+                .expect("hardcoded zero-address fallback")
+        });
 
         client
             .write_all(&self.build_socks5_response(local_addr))
@@ -283,11 +291,7 @@ impl TcpProxy {
     ///
     /// Reads the full `CONNECT host:port HTTP/1.1\r\n…\r\n\r\n` request,
     /// checks the target domain against the allowlist, then relays if allowed.
-    async fn handle_http_connect(
-        &self,
-        mut client: TcpStream,
-        first_byte: u8,
-    ) -> Result<()> {
+    async fn handle_http_connect(&self, mut client: TcpStream, first_byte: u8) -> Result<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // Read the rest of the HTTP CONNECT request line (up to 4 KiB).
@@ -327,7 +331,9 @@ impl TcpProxy {
             let _ = client
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
                 .await;
-            return Err(ProxyError::DomainBlocked { domain: domain_lower });
+            return Err(ProxyError::DomainBlocked {
+                domain: domain_lower,
+            });
         }
 
         // Resolve the host.
@@ -344,11 +350,10 @@ impl TcpProxy {
                 message: "no addresses returned".to_string(),
             })?;
 
-        let destination = self.connect_to_destination(dest).await.map_err(|e| {
+        let destination = self.connect_to_destination(dest).await.inspect_err(|_e| {
             let _ = tokio::runtime::Handle::try_current().map(|_| {
                 // best-effort; we're in async context
             });
-            e
         })?;
 
         // Send 200 Connection Established.
@@ -402,32 +407,34 @@ impl TcpProxy {
         // Domain-based (ATYP=0x03).
         let domain_len = data[4] as usize;
         if data.len() < 5 + domain_len + 2 {
-            return Err(ProxyError::Internal("SOCKS5 domain request too short".to_string()));
+            return Err(ProxyError::Internal(
+                "SOCKS5 domain request too short".to_string(),
+            ));
         }
         let domain = std::str::from_utf8(&data[5..5 + domain_len])
             .map_err(|_| ProxyError::Internal("Invalid domain encoding".to_string()))?;
-        let port = u16::from_be_bytes([
-            data[5 + domain_len],
-            data[5 + domain_len + 1],
-        ]);
+        let port = u16::from_be_bytes([data[5 + domain_len], data[5 + domain_len + 1]]);
         let domain_lower = domain.to_lowercase();
 
         if !self.state.is_allowed(&domain_lower) {
             self.state.report_violation(format!(
                 "network: DNS query for \"{domain_lower}\" blocked — domain not in allowlist"
             ));
-            return Err(ProxyError::DomainBlocked { domain: domain_lower });
+            return Err(ProxyError::DomainBlocked {
+                domain: domain_lower,
+            });
         }
 
         // Resolve via system resolver (domain is allowed).
         let addr_str = format!("{domain}:{port}");
         let domain_owned = domain.to_string();
-        let mut addrs = tokio::net::lookup_host(addr_str)
-            .await
-            .map_err(|e| ProxyError::DnsResolution {
-                domain: domain_owned.clone(),
-                message: e.to_string(),
-            })?;
+        let mut addrs =
+            tokio::net::lookup_host(addr_str)
+                .await
+                .map_err(|e| ProxyError::DnsResolution {
+                    domain: domain_owned.clone(),
+                    message: e.to_string(),
+                })?;
         addrs.next().ok_or_else(|| ProxyError::DnsResolution {
             domain: domain_owned,
             message: "no addresses returned".to_string(),
@@ -1530,11 +1537,8 @@ mod tests {
 
         // Proxy drops conn3 because limit is reached; read must return EOF
         let mut buf = [0u8; 1];
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            conn3.read(&mut buf),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(500), conn3.read(&mut buf)).await;
 
         assert!(result.is_ok(), "Should get a response before timeout");
         let n = result.unwrap().unwrap_or(0);

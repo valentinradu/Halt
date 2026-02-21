@@ -57,7 +57,6 @@
 //! - No authentication needed (localhost-only binding is the security boundary)
 //!
 
-
 mod dns;
 mod filter;
 mod proxy;
@@ -175,9 +174,7 @@ impl ResolutionCache {
         entries.retain(|_, (r, _)| r.expires_at > now);
 
         // 2. If still at or over capacity, evict oldest-by-insertion-time
-        while !entries.is_empty()
-            && entries.len() + resolved.addresses.len() > self.max_entries
-        {
+        while !entries.is_empty() && entries.len() + resolved.addresses.len() > self.max_entries {
             if let Some(&oldest_ip) = entries
                 .iter()
                 .min_by_key(|(_, (_, inserted_at))| *inserted_at)

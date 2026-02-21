@@ -30,16 +30,16 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
             .iter()
             .map(|p| p.to_string_lossy().into_owned()),
     );
-    config.sandbox.paths.read.extend(
-        args.read
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
-    config.sandbox.paths.read_write.extend(
-        args.write
-            .iter()
-            .map(|p| p.to_string_lossy().into_owned()),
-    );
+    config
+        .sandbox
+        .paths
+        .read
+        .extend(args.read.iter().map(|p| p.to_string_lossy().into_owned()));
+    config
+        .sandbox
+        .paths
+        .read_write
+        .extend(args.write.iter().map(|p| p.to_string_lossy().into_owned()));
     config
         .proxy
         .domain_allowlist
@@ -49,10 +49,7 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     let wants_proxy = match args.network {
         Some(NetworkModeArg::Proxy) => true,
         None if !args.allow.is_empty() => true,
-        _ => matches!(
-            config.sandbox.network,
-            Some(NetworkMode::ProxyOnly { .. })
-        ),
+        _ => matches!(config.sandbox.network, Some(NetworkMode::ProxyOnly { .. })),
     };
 
     let base_network: NetworkMode = match args.network {
@@ -108,9 +105,13 @@ pub async fn run(args: RunArgs, cwd: PathBuf) -> Result<(), CliError> {
     // Always start with system defaults as the base, then extend with
     // user-provided paths so the sandbox has sensible baseline access on macOS.
     let mut merged_paths = SandboxPaths::system_defaults();
-    merged_paths.traversal.extend(config.sandbox.paths.traversal);
+    merged_paths
+        .traversal
+        .extend(config.sandbox.paths.traversal);
     merged_paths.read.extend(config.sandbox.paths.read);
-    merged_paths.read_write.extend(config.sandbox.paths.read_write);
+    merged_paths
+        .read_write
+        .extend(config.sandbox.paths.read_write);
 
     let needs_netns_cleanup = matches!(resolved_network, NetworkMode::ProxyOnly { .. });
 
@@ -211,9 +212,7 @@ fn print_violation(violation: &str) {
         if let Some(start) = violation.find('"') {
             if let Some(end) = violation[start + 1..].find('"') {
                 let domain = &violation[start + 1..start + 1 + end];
-                format!(
-                    "add \"{domain}\" to [proxy.domain_allowlist] in your halt config"
-                )
+                format!("add \"{domain}\" to [proxy.domain_allowlist] in your halt config")
             } else {
                 "add the domain to [proxy.domain_allowlist] in your halt config".to_string()
             }
@@ -240,7 +239,7 @@ fn print_violation(violation: &str) {
         match path {
             Some(p) if !p.is_empty() => {
                 let is_dir = std::path::Path::new(p).is_dir();
-                let is_write = op.map_or(false, |o| o.contains("write"));
+                let is_write = op.is_some_and(|o| o.contains("write"));
                 if is_write {
                     format!("add \"{p}\" to [sandbox.paths.read_write] in your halt config")
                 } else if is_dir {
@@ -263,9 +262,7 @@ fn print_violation(violation: &str) {
     eprintln!("halt: sandboxed process killed (exit 2).");
 }
 
-fn build_proxy_config(
-    settings: &halt_settings::ProxySettings,
-) -> Result<ProxyConfig, CliError> {
+fn build_proxy_config(settings: &halt_settings::ProxySettings) -> Result<ProxyConfig, CliError> {
     let mut config = ProxyConfig {
         domain_allowlist: settings.domain_allowlist.clone(),
         ..Default::default()
@@ -285,9 +282,8 @@ fn build_proxy_config(
             .iter()
             .map(|s| s.parse::<std::net::SocketAddr>())
             .collect();
-        config.upstream_dns = Some(
-            addrs.map_err(|e| CliError::Other(format!("Invalid upstream_dns entry: {e}")))?,
-        );
+        config.upstream_dns =
+            Some(addrs.map_err(|e| CliError::Other(format!("Invalid upstream_dns entry: {e}")))?);
     }
 
     Ok(config)
