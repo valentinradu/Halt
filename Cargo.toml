@@ -3,7 +3,7 @@ members = ["crates/halt", "crates/halt-proxy", "crates/halt-sandbox", "crates/ha
 resolver = "2"
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 authors = ["Valentin Radu"]
 license = "MIT"
