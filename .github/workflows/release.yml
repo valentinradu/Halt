@@ -120,7 +120,8 @@ jobs:
           VERSION="${{ github.ref_name }}"
           VERSION="${VERSION#v}"
           cargo deb -p halt --target ${{ matrix.target }} --no-build \
-            --deb-version "$VERSION"
+            --deb-version "$VERSION" \
+            --no-strip
           mv target/${{ matrix.target }}/debian/*.deb \
              halt_${VERSION}_${{ matrix.arch }}.deb
 
