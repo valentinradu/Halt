@@ -786,7 +786,6 @@ mod tests {
                 {
                     // Some CI/container environments expose Landlock but deny
                     // applying it in pre_exec.
-                    return;
                 }
                 Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
             }
@@ -827,7 +826,6 @@ mod tests {
                 {
                     // Some CI/container environments expose Landlock but deny
                     // applying it in pre_exec.
-                    return;
                 }
                 Err(e) => panic!("spawn_with_landlock failed: {:?}", e),
             }
