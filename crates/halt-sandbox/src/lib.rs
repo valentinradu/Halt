@@ -284,9 +284,7 @@ mod tests {
                     assert!(status.success());
                 }
                 Err(SandboxError::SpawnFailed(err))
-                    if err.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                }
+                    if err.kind() == std::io::ErrorKind::PermissionDenied => {}
                 Err(e) => panic!("spawn_sandboxed failed: {:?}", e),
             }
         }
